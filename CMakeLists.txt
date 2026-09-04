@@ -70,9 +70,13 @@ target_link_libraries(test_autograd_adamw PRIVATE sore_core)
 add_executable(test_mmap_dataloader tests/test_mmap_dataloader.cpp)
 target_link_libraries(test_mmap_dataloader PRIVATE sore_core)
 
-# Executável de Treinamento Completo
+# Executáveis de Treinamento
 add_executable(train_linear_rnn examples/train_linear_rnn.cpp)
 target_link_libraries(train_linear_rnn PRIVATE sore_core)
+
+add_executable(train_sequential examples/train_sequential.cpp)
+target_link_libraries(train_sequential PRIVATE sore_core)
+
 
 
 
