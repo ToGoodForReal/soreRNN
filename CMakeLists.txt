@@ -26,6 +26,7 @@ add_library(sore_core
     src/nn/autograd.cpp
     src/nn/embedding.cpp
     src/nn/loss.cpp
+    src/nn/stacked_rnn.cpp
     src/data/dataloader.cpp
     src/cuda/ops.cu
     src/cuda/scan.cu
@@ -76,6 +77,12 @@ target_link_libraries(train_linear_rnn PRIVATE sore_core)
 
 add_executable(train_sequential examples/train_sequential.cpp)
 target_link_libraries(train_sequential PRIVATE sore_core)
+
+add_executable(train_lm_150m examples/train_lm_150m.cpp)
+target_link_libraries(train_lm_150m PRIVATE sore_core)
+
+add_executable(train_sft examples/train_sft.cpp)
+target_link_libraries(train_sft PRIVATE sore_core)
 
 
 

@@ -86,8 +86,8 @@ void MMapDataset::cleanup() noexcept {
     num_tokens_ = 0;
 }
 
-DataLoader::DataLoader(std::shared_ptr<MMapDataset> dataset, size_t batch_size, size_t seq_len)
-    : dataset_(std::move(dataset)), batch_size_(batch_size), seq_len_(seq_len) {
+DataLoader::DataLoader(std::shared_ptr<MMapDataset> dataset, size_t batch_size, size_t seq_len, bool is_paired)
+    : dataset_(std::move(dataset)), batch_size_(batch_size), seq_len_(seq_len), is_paired_(is_paired) {
     if (!dataset_ || dataset_->total_tokens() == 0) {
         throw std::runtime_error("DataLoader inicializado com dataset vazio.");
     }
@@ -95,12 +95,17 @@ DataLoader::DataLoader(std::shared_ptr<MMapDataset> dataset, size_t batch_size, 
 
 bool DataLoader::has_next() const noexcept {
     if (!dataset_) return false;
-    size_t tokens_needed = batch_size_ * seq_len_ + 1;
+    size_t tokens_needed = is_paired_ ? (batch_size_ * seq_len_ * 2) : (batch_size_ * seq_len_ + 1);
     return (current_cursor_ + tokens_needed) <= dataset_->total_tokens();
 }
 
 size_t DataLoader::total_batches() const noexcept {
-    if (!dataset_ || dataset_->total_tokens() <= 1) return 0;
+    if (!dataset_) return 0;
+    if (is_paired_) {
+        size_t tokens_per_batch = batch_size_ * seq_len_ * 2;
+        return dataset_->total_tokens() / tokens_per_batch;
+    }
+    if (dataset_->total_tokens() <= 1) return 0;
     size_t tokens_per_batch = batch_size_ * seq_len_;
     return (dataset_->total_tokens() - 1) / tokens_per_batch;
 }
@@ -116,16 +121,28 @@ DataLoader::Batch DataLoader::next() {
 
     const uint16_t* raw_tokens = dataset_->token_data();
 
-    for (size_t b = 0; b < batch_size_; ++b) {
-        size_t start = current_cursor_ + b * seq_len_;
-        for (size_t t = 0; t < seq_len_; ++t) {
-            size_t out_idx = b * seq_len_ + t;
-            batch.inputs[out_idx] = raw_tokens[start + t];
-            batch.targets[out_idx] = raw_tokens[start + t + 1]; // Próximo token no tempo
+    if (is_paired_) {
+        for (size_t b = 0; b < batch_size_; ++b) {
+            size_t start = current_cursor_ + b * seq_len_ * 2;
+            for (size_t t = 0; t < seq_len_; ++t) {
+                size_t out_idx = b * seq_len_ + t;
+                batch.inputs[out_idx] = raw_tokens[start + 2 * t];
+                batch.targets[out_idx] = raw_tokens[start + 2 * t + 1];
+            }
         }
+        current_cursor_ += batch_size_ * seq_len_ * 2;
+    } else {
+        for (size_t b = 0; b < batch_size_; ++b) {
+            size_t start = current_cursor_ + b * seq_len_;
+            for (size_t t = 0; t < seq_len_; ++t) {
+                size_t out_idx = b * seq_len_ + t;
+                batch.inputs[out_idx] = raw_tokens[start + t];
+                batch.targets[out_idx] = raw_tokens[start + t + 1]; // Próximo token no tempo
+            }
+        }
+        current_cursor_ += batch_size_ * seq_len_;
     }
 
-    current_cursor_ += batch_size_ * seq_len_;
     return batch;
 }
 
