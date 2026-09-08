@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Inferência Interativa e Geração de Texto em Tempo O(1)
-para o Modelo RNN Linear (Griffin / soreRNN).
+para o Modelo soreRNN-LM v2 (152.3M Parâmetros / 12 Camadas).
+Implementa Conv1D, RG-LRU, GELU MLP, Weight Tying e Amostragem com Repetition Penalty.
 """
 
 import os
@@ -10,11 +11,23 @@ import argparse
 import numpy as np
 import tiktoken
 
-class LinearRNNGenerator:
-    def __init__(self, checkpoint_path: str, vocab_size: int = 50257, emb_dim: int = 32, hidden_dim: int = 64):
+class StackedRNNGenerator:
+    def __init__(
+        self,
+        checkpoint_path: str,
+        vocab_size: int = 50257,
+        d_model: int = 1024,
+        num_layers: int = 12,
+        d_mlp: int = 2560,
+        conv_kernel: int = 4,
+        eps: float = 1e-5
+    ):
         self.vocab_size = vocab_size
-        self.emb_dim = emb_dim
-        self.hidden_dim = hidden_dim
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.d_mlp = d_mlp
+        self.conv_kernel = conv_kernel
+        self.eps = eps
         self.enc = tiktoken.get_encoding("gpt2")
 
         if not os.path.exists(checkpoint_path):
@@ -23,107 +36,221 @@ class LinearRNNGenerator:
         raw = np.fromfile(checkpoint_path, dtype=np.float32)
         offset = 0
 
-        # Carregamento na ordem exata salva pelo train_sequential.cpp
         def read_tensor(shape):
             nonlocal offset
             numel = int(np.prod(shape))
+            if offset + numel > len(raw):
+                raise ValueError(f"Fim de arquivo prematuro lendo tensor {shape}: precisa {numel}, resta {len(raw) - offset}")
             tensor = raw[offset : offset + numel].reshape(shape)
             offset += numel
             return tensor
 
-        self.w_emb = read_tensor((vocab_size, emb_dim))
-        self.w_head = read_tensor((vocab_size, emb_dim))
+        # 1. Embedding e LM Head (Weight Tied)
+        self.w_emb = read_tensor((vocab_size, d_model))
         self.b_head = read_tensor((vocab_size,))
+        self.final_norm_gamma = read_tensor((d_model,))
 
-        self.w_gate = read_tensor((hidden_dim, emb_dim))
-        self.b_gate = read_tensor((hidden_dim,))
-        self.w_in = read_tensor((hidden_dim, emb_dim))
-        self.b_in = read_tensor((hidden_dim,))
-        self.w_out = read_tensor((emb_dim, hidden_dim))
-        self.b_out = read_tensor((emb_dim,))
+        # 2. 12 Camadas
+        self.layers = []
+        for l in range(num_layers):
+            layer = {
+                # Bloco Recorrente + Conv1D
+                "norm1_gamma": read_tensor((d_model,)),
+                "w_conv": read_tensor((d_model, conv_kernel)),
+                "b_conv": read_tensor((d_model,)),
+                "w_gate": read_tensor((d_model, d_model)),
+                "b_gate": read_tensor((d_model,)),
+                "w_in": read_tensor((d_model, d_model)),
+                "b_in": read_tensor((d_model,)),
+                "w_out": read_tensor((d_model, d_model)),
+                "b_out": read_tensor((d_model,)),
+                # Bloco MLP
+                "norm2_gamma": read_tensor((d_model,)),
+                "w_mlp1": read_tensor((d_mlp, d_model)),
+                "b_mlp1": read_tensor((d_mlp,)),
+                "w_mlp2": read_tensor((d_model, d_mlp)),
+                "b_mlp2": read_tensor((d_model,)),
+            }
+            self.layers.append(layer)
 
-        print(f"[Modelo] Checkpoint carregado: {checkpoint_path}")
-        print(f" -> Vocabulário: {vocab_size} | Emb Dim: {emb_dim} | Hidden Dim: {hidden_dim}")
-        print(f" -> Total de Parâmetros: {offset:,} floats (~{offset * 4 / (1024*1024):.2f} MB)")
+        print(f"[soreRNN-LM v2] Checkpoint carregado: {checkpoint_path}")
+        print(f" -> Arquitetura: {num_layers} camadas | d_model={d_model} | d_mlp={d_mlp} | K={conv_kernel}")
+        print(f" -> Weight Tying: Sim (w_head compartilhado com w_emb)")
+        print(f" -> Parâmetros lidos: {offset:,} floats (~{offset * 4 / (1024*1024):.2f} MB)")
 
-    def step(self, token: int, h_prev: np.ndarray):
-        """Passo de inferência autoregressiva da RNN Linear em tempo O(1) e memória O(1)."""
-        x_emb = self.w_emb[token] # [emb_dim]
+    def rms_norm(self, x: np.ndarray, gamma: np.ndarray) -> np.ndarray:
+        rms = np.sqrt(np.mean(x ** 2) + self.eps)
+        return (x / rms) * gamma
 
-        # 1. Decay Gate: a = sigmoid(W_gate * x + b_gate)
-        g = self.w_gate @ x_emb + self.b_gate
-        a = 1.0 / (1.0 + np.exp(-np.clip(g, -20.0, 20.0)))
+    def gelu(self, x: np.ndarray) -> np.ndarray:
+        return 0.5 * x * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
 
-        # 2. Input Candidate: u = W_in * x + b_in
-        u = self.w_in @ x_emb + self.b_in
+    def step(self, token: int, h_states: list, conv_buffers: list):
+        """Passo O(1) através das 12 camadas empilhadas com Conv1D, RG-LRU e MLP."""
+        x = self.w_emb[token]
 
-        # 3. Recorrência Linear Real-Gated: h = a * h_prev + u
-        h = a * h_prev + u
+        for l in range(self.num_layers):
+            layer = self.layers[l]
 
-        # 4. Projeção de Saída: y = W_out * h + b_out
-        y = self.w_out @ h + self.b_out
+            # --- Bloco 1: Recorrência + Conv1D ---
+            x_norm1 = self.rms_norm(x, layer["norm1_gamma"])
 
-        # 5. Logits do Vocabulário: logits = W_head * y + b_head
-        logits = self.w_head @ y + self.b_head
+            # Causal Depthwise Conv1D
+            buf = conv_buffers[l] # [3, D]
+            w_c = layer["w_conv"] # [D, 4]
+            # lag 3: buf[0], lag 2: buf[1], lag 1: buf[2], lag 0: x_norm1
+            x_conv = (
+                buf[0] * w_c[:, 0] +
+                buf[1] * w_c[:, 1] +
+                buf[2] * w_c[:, 2] +
+                x_norm1 * w_c[:, 3] +
+                layer["b_conv"]
+            )
+            # Atualiza rolling buffer de convolução
+            buf[0] = buf[1]
+            buf[1] = buf[2]
+            buf[2] = x_norm1
 
-        return logits, h
+            # Gate & Sigmoid
+            g = layer["w_gate"] @ x_conv + layer["b_gate"]
+            a = 1.0 / (1.0 + np.exp(-np.clip(g, -20.0, 20.0)))
 
-    def sample_token(self, logits: np.ndarray, temperature: float = 0.8, top_k: int = 40):
+            # Projeção de Entrada & Recorrência Linear
+            u = layer["w_in"] @ x_conv + layer["b_in"]
+            h_states[l] = a * h_states[l] + u
+
+            # Projeção de Saída & Conexão Residual 1
+            y_rnn = layer["w_out"] @ h_states[l] + layer["b_out"]
+            x = x + y_rnn
+
+            # --- Bloco 2: MLP Channel Mixing ---
+            x_norm2 = self.rms_norm(x, layer["norm2_gamma"])
+            m1 = layer["w_mlp1"] @ x_norm2 + layer["b_mlp1"]
+            # Fast GELU aproximado: 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+            m1_act = 0.5 * m1 * (1.0 + np.tanh(0.79788456 * (m1 + 0.044715 * m1 ** 3)))
+            y_mlp = layer["w_mlp2"] @ m1_act + layer["b_mlp2"]
+
+            # Conexão Residual 2
+            x = x + y_mlp
+
+        # RMSNorm Final
+        x_final = self.rms_norm(x, self.final_norm_gamma)
+
+        # LM Head Logits com Weight Tying (w_emb)
+        logits = self.w_emb @ x_final + self.b_head
+        return logits, h_states, conv_buffers
+
+    def sample_token(
+        self,
+        logits: np.ndarray,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.15,
+        context_tokens: list = None
+    ):
+        logits = logits.copy()
+
+        # Repetition Penalty
+        if context_tokens and repetition_penalty != 1.0:
+            for prev_tok in set(context_tokens[-30:]):
+                if logits[prev_tok] > 0:
+                    logits[prev_tok] /= repetition_penalty
+                else:
+                    logits[prev_tok] *= repetition_penalty
+
         if temperature <= 0.0:
             return int(np.argmax(logits))
 
-        # Estabilidade numérica
         logits = logits / max(temperature, 1e-4)
-        max_logit = np.max(logits)
-        exp_logits = np.exp(logits - max_logit)
 
-        # Top-K filtering
+        # Top-K
         if top_k > 0 and top_k < len(logits):
             top_indices = np.argpartition(logits, -top_k)[-top_k:]
             mask = np.zeros_like(logits, dtype=bool)
             mask[top_indices] = True
-            exp_logits[~mask] = 0.0
+            logits[~mask] = -1e9
 
+        # Softmax
+        max_logit = np.max(logits)
+        exp_logits = np.exp(logits - max_logit)
         probs = exp_logits / np.sum(exp_logits)
+
+        # Top-P (Nucleus)
+        if top_p < 1.0:
+            sorted_indices = np.argsort(probs)[::-1]
+            sorted_probs = probs[sorted_indices]
+            cum_probs = np.cumsum(sorted_probs)
+            cutoff = cum_probs > top_p
+            if np.any(cutoff):
+                cutoff_idx = np.where(cutoff)[0][0] + 1
+                sorted_probs[cutoff_idx:] = 0.0
+                sorted_probs = sorted_probs / np.sum(sorted_probs)
+                probs = np.zeros_like(probs)
+                probs[sorted_indices] = sorted_probs
+
+        sum_probs = np.sum(probs)
+        if sum_probs == 0 or np.isnan(sum_probs):
+            return int(np.argmax(logits))
+
+        probs = probs / sum_probs
         return int(np.random.choice(len(probs), p=probs))
 
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 40):
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 60,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.15
+    ):
         tokens = self.enc.encode(prompt, allowed_special={"<|endoftext|>"})
-        h = np.zeros(self.hidden_dim, dtype=np.float32)
+        h_states = [np.zeros(self.d_model, dtype=np.float32) for _ in range(self.num_layers)]
+        conv_buffers = [np.zeros((3, self.d_model), dtype=np.float32) for _ in range(self.num_layers)]
 
-        # Pré-alimentação (Prefill) do prompt na memória oculta h
+        # Prefill do prompt
         logits = None
         for tok in tokens:
-            logits, h = self.step(tok, h)
+            logits, h_states, conv_buffers = self.step(tok, h_states, conv_buffers)
 
         generated_tokens = []
         current_tok = tokens[-1] if tokens else 0
-
-        print(prompt, end="", flush=True)
+        all_tokens = list(tokens)
 
         for _ in range(max_new_tokens):
             if logits is None:
-                logits, h = self.step(current_tok, h)
+                logits, h_states, conv_buffers = self.step(current_tok, h_states, conv_buffers)
 
-            next_tok = self.sample_token(logits, temperature=temperature, top_k=top_k)
+            next_tok = self.sample_token(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                context_tokens=all_tokens
+            )
             generated_tokens.append(next_tok)
+            all_tokens.append(next_tok)
 
             word = self.enc.decode([next_tok])
             print(word, end="", flush=True)
 
-            if word in ["<|endoftext|>", "<|user|>"]:
+            if word in ["<|endoftext|>", "<|user|>", "\n\n"]:
                 break
 
             current_tok = next_tok
-            logits, h = self.step(current_tok, h)
+            logits, h_states, conv_buffers = self.step(current_tok, h_states, conv_buffers)
 
         print()
         return self.enc.decode(generated_tokens)
 
 def interactive_chat(checkpoint_path: str):
-    bot = LinearRNNGenerator(checkpoint_path)
+    bot = StackedRNNGenerator(checkpoint_path)
+    is_pretrain = "pretrain" in checkpoint_path
+    mode_name = "Base Pretrain (Completador de Raciocínio)" if is_pretrain else "SFT Instruído (Chatbot)"
     print("\n" + "=" * 65)
-    print("  CHAT INTERATIVO - RNN LINEAR soreRNN (Tempo O(1) por Token)")
+    print(f"  CHAT INTERATIVO - soreRNN-LM v2 ({mode_name})")
     print("  (Digite 'sair' para encerrar)")
     print("=" * 65 + "\n")
 
@@ -136,24 +263,37 @@ def interactive_chat(checkpoint_path: str):
                 print("Até mais!")
                 break
 
-            formatted_prompt = f"<|user|>\n{user_input}\n<|assistant|>\n"
-            print("soreRNN: ", end="", flush=True)
-            bot.generate(formatted_prompt, max_new_tokens=40, temperature=0.7)
+            if is_pretrain:
+                if user_input.startswith("Problema:") or user_input.startswith("Pergunta:"):
+                    formatted_prompt = user_input + "\nRaciocínio:"
+                else:
+                    formatted_prompt = f"Problema: {user_input}\nRaciocínio:"
+                print("soreRNN [Raciocínio]: ", end="", flush=True)
+            else:
+                formatted_prompt = f"<|user|>\n{user_input}\n<|assistant|>\n"
+                print("soreRNN: ", end="", flush=True)
+
+            bot.generate(formatted_prompt, max_new_tokens=60, temperature=0.3, repetition_penalty=1.15)
             print()
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando...")
             break
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Inferência da RNN Linear")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_chat_final.bin")
+    parser = argparse.ArgumentParser(description="Inferência da soreRNN-LM v2")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/sore_lm_150m_final.bin")
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--max_tokens", type=int, default=50)
+    parser.add_argument("--max_tokens", type=int, default=60)
     parser.add_argument("--temp", type=float, default=0.7)
+    parser.add_argument("--rep_penalty", type=float, default=1.15)
     args = parser.parse_args()
 
+    if not os.path.exists(args.checkpoint):
+        if os.path.exists("checkpoints/sore_lm_150m_pretrain.bin"):
+            args.checkpoint = "checkpoints/sore_lm_150m_pretrain.bin"
+
     if args.prompt:
-        bot = LinearRNNGenerator(args.checkpoint)
-        bot.generate(args.prompt, max_new_tokens=args.max_tokens, temperature=args.temp)
+        bot = StackedRNNGenerator(args.checkpoint)
+        bot.generate(args.prompt, max_new_tokens=args.max_tokens, temperature=args.temp, repetition_penalty=args.rep_penalty)
     else:
         interactive_chat(args.checkpoint)

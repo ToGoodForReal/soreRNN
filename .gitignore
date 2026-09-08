@@ -19,3 +19,7 @@ Thumbs.db
 # Generated artifacts (produced by scripts/prepare_data.py and train_sequential)
 checkpoints/
 data/*.bin
+
+# Local artifacts
+logs/
+__pycache__/

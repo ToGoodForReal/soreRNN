@@ -44,11 +44,11 @@ private:
  */
 class DataLoader {
 public:
-    DataLoader(std::shared_ptr<MMapDataset> dataset, size_t batch_size, size_t seq_len);
+    DataLoader(std::shared_ptr<MMapDataset> dataset, size_t batch_size, size_t seq_len, bool is_paired = false);
 
     struct Batch {
         std::vector<uint16_t> inputs;  // [B, T]
-        std::vector<uint16_t> targets; // [B, T] (offset de +1 token no tempo)
+        std::vector<uint16_t> targets; // [B, T] (offset de +1 token no tempo ou mascarado com 65535)
     };
 
     [[nodiscard]] bool has_next() const noexcept;
@@ -61,6 +61,7 @@ private:
     std::shared_ptr<MMapDataset> dataset_;
     size_t batch_size_;
     size_t seq_len_;
+    bool is_paired_{false};
     size_t current_cursor_{0};
 };
 
