@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 soreRNN-LM: Filtros de Qualidade e Deduplicação em Escala Industrial (MinHash + LSH)
@@ -21,13 +22,17 @@ class MinHashDeduplicator:
         num_bands: int = 16,
         shingle_size: int = 5,
         jaccard_threshold: float = 0.75,
-        seed: int = 42
+        seed: int = 42,
+        max_lsh_docs: int = int(os.environ.get("SORE_MAX_LSH_DOCS", 5_000_000))
     ):
         self.num_hashes = num_hashes
         self.num_bands = num_bands
         self.rows_per_band = num_hashes // num_bands
         self.k = shingle_size
         self.threshold = jaccard_threshold
+        # Teto de memória: acima deste nº de docs de treino, o LSH (assinaturas + tabelas de banda)
+        # para de crescer e a deduplicação continua apenas por hash exato (pega os reciclados idênticos).
+        self.max_lsh_docs = max_lsh_docs
 
         # Parâmetros de hashing linear: (a * x + b) % p
         self.p = (1 << 61) - 1 # Mersenne prime
@@ -100,6 +105,9 @@ class MinHashDeduplicator:
         if h in self.exact_train_hashes:
             return True
 
+        if len(self.train_signatures) >= self.max_lsh_docs:
+            return False  # acima do teto de memória: mantém (dedup exato já foi checado)
+
         if not self.train_signatures:
             return False
 
@@ -150,6 +158,10 @@ class MinHashDeduplicator:
         h = xxhash.xxh64_intdigest(norm.encode("utf-8"))
         if h in self.exact_val_hashes or h in self.exact_train_hashes:
             return False
+
+        if len(self.train_signatures) >= self.max_lsh_docs:
+            self.exact_train_hashes.add(h)  # acima do teto: só hash exato (memória limitada)
+            return True
 
         sig = self.compute_signature(text)
 
