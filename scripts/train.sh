@@ -26,11 +26,11 @@ PRE_TOKENS="${PRE_TOKENS:-200000000}"
 SFT_TOKENS="${SFT_TOKENS:-8000000}"
 
 if [ "$MODEL" = "300m" ]; then
-  BIN="train_lm_300m";  STEPS="${3:-150000}"; MICRO=2; ACCUM=8; SEQ=512
-  PRETRAIN_DATA="data/pretrain_interleaved.bin"; SFT_DATA="data/sft_500m.bin"
+  BIN="train_lm_300m";  STEPS="${3:-150000}"; MICRO=1; ACCUM=16; SEQ=512  # micro=1 cabe em 8GB (~6GB VRAM, ~3250 tok/s)
+  PRETRAIN_DATA="data/pretrain_interleaved.bin"; SFT_DATA="data/sft_500m.bin"; SFT_BATCH=1
 else
   BIN="train_lm_150m";  STEPS="${3:-100000}"; MICRO=4; ACCUM=4; SEQ=1024
-  PRETRAIN_DATA="data/pretrain_75pt_25en.bin";  SFT_DATA="data/sft_chat_pt.bin"
+  PRETRAIN_DATA="data/pretrain_75pt_25en.bin";  SFT_DATA="data/sft_chat_pt.bin"; SFT_BATCH=4
 fi
 VAL_DATA="data/val.bin"; DPO_DATA="data/dpo_pairs.bin"
 PRE_CKPT="checkpoints/sore_lm_${MODEL}_pretrain.bin"
@@ -75,7 +75,7 @@ do_sft() {
   if [ ! -f "$SFT_DATA" ]; then
     "$PYTHON_BIN" scripts/prepare_500m_sft.py --out "$SFT_DATA" --val_out data/sft_val.bin --tokens "$SFT_TOKENS"
   fi
-  ./build/train_sft "$PRE_CKPT" "$SFT_DATA" "$SFT_CKPT" 1500 4 512 data/sft_val.bin 2>&1 | tee "logs/sft_${MODEL}.log"
+  ./build/train_sft "$PRE_CKPT" "$SFT_DATA" "$SFT_CKPT" 1500 "$SFT_BATCH" 512 data/sft_val.bin 2>&1 | tee "logs/sft_${MODEL}.log"
 }
 
 do_dpo() {
