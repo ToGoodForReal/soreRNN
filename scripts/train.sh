@@ -62,10 +62,13 @@ do_pretrain() {
   # ATENÇÃO: train_lm_150m = [pretrain_steps][sft_steps][micro][accum][seq]
   #          train_lm_300m = [pretrain_steps][micro][accum][seq]
   # Mantemos SFT interno DESLIGADO (sft_steps=0) -> SFT roda depois, uma vez só.
+  # RESUME=1 -> retoma do checkpoint de pre-treino existente (salva a cada 250 passos)
+  RESUME_ARG=""
+  if [ "${RESUME:-0}" = "1" ] && [ -f "$PRE_CKPT" ]; then RESUME_ARG="$PRE_CKPT"; echo " -> Retomando de $PRE_CKPT"; fi
   if [ "$MODEL" = "300m" ]; then
-    ./build/train_lm_300m "$STEPS" "$MICRO" "$ACCUM" "$SEQ" 2>&1 | tee "logs/pretrain_${MODEL}.log"
+    ./build/train_lm_300m "$STEPS" "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee "logs/pretrain_${MODEL}.log"
   else
-    ./build/train_lm_150m "$STEPS" 0 "$MICRO" "$ACCUM" "$SEQ" 2>&1 | tee "logs/pretrain_${MODEL}.log"
+    ./build/train_lm_150m "$STEPS" 0 "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee "logs/pretrain_${MODEL}.log"
   fi
 }
 
