@@ -24,6 +24,11 @@ Tensor matmul2d_cuda(const Tensor& A, const Tensor& B);
  */
 Tensor linear_cuda(const Tensor& X, const Tensor& W, const Tensor* bias = nullptr);
 
+/** Registra/atualiza espelhos BF16 dos pesos 2D FP32 (chamar 1x por passo do otimizador). */
+void refresh_bf16_weights(const std::vector<Tensor*>& params);
+/** Libera todos os espelhos BF16 (ex.: ao trocar de modelo). */
+void clear_bf16_weights();
+
 /**
  * @brief Sigmóide elemento a elemento acelerado por hardware GPU (SFU __expf)
  */

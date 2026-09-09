@@ -24,3 +24,5 @@ data/*.bin
 logs/
 __pycache__/
 .venv/
+backup_old/
+*.bin

@@ -9,6 +9,58 @@
 namespace sore {
 namespace cuda {
 
+// ===================== Suporte a precisao mista (BF16) =====================
+#include <cuda_bf16.h>
+#include <unordered_map>
+
+__global__ void fp32_to_bf16_kernel(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, size_t n){
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for(; i < n; i += stride){ dst[i] = __float2bfloat16(src[i]); }
+}
+static inline void launch_fp32_to_bf16(const float* src, void* dst, size_t n){
+    if(n==0) return;
+    constexpr int threads=256;
+    int blocks=(int)std::min((n + threads - 1)/(size_t)threads, (size_t)8192);
+    fp32_to_bf16_kernel<<<blocks,threads>>>(src, (__nv_bfloat16*)dst, n);
+}
+
+// Espelhos BF16 persistentes das matrizes de peso FP32 (atualizados 1x por passo do otimizador).
+struct Bf16Mirror { void* ptr=nullptr; size_t numel=0; };
+static std::unordered_map<const void*, Bf16Mirror>& bf16_mirrors(){
+    static std::unordered_map<const void*, Bf16Mirror> m; return m;
+}
+static void* bf16_mirror_of(const void* key){
+    auto& m = bf16_mirrors(); auto it=m.find(key); return it==m.end()? nullptr : it->second.ptr;
+}
+void refresh_bf16_weights(const std::vector<Tensor*>& params){
+    auto& m = bf16_mirrors();
+    for(auto* t : params){
+        if(!t || !t->is_defined() || t->device()!=Device::CUDA) continue;
+        if(t->rank()!=2) continue;
+        if(t->dtype()!=DType::Float32) continue;
+        const float* wp = t->data<float>();
+        size_t n = t->numel();
+        Bf16Mirror& mir = m[wp];
+        if(mir.numel!=n){
+            if(mir.ptr) CUDACachingAllocator::instance().deallocate(mir.ptr);
+            mir.ptr = CUDACachingAllocator::instance().allocate(n*sizeof(__nv_bfloat16));
+            mir.numel = n;
+        }
+        launch_fp32_to_bf16(wp, mir.ptr, n);
+    }
+}
+void clear_bf16_weights(){
+    auto& m = bf16_mirrors();
+    for(auto& kv : m){ if(kv.second.ptr) CUDACachingAllocator::instance().deallocate(kv.second.ptr); }
+    m.clear();
+}
+static void* bf16_cast_tmp(const float* src, size_t n){
+    void* p = CUDACachingAllocator::instance().allocate(n*sizeof(__nv_bfloat16));
+    launch_fp32_to_bf16(src, p, n);
+    return p;
+}
+
 // Kernel de broadcast e adição de viés com grid-stride loop
 __global__ void add_bias_kernel(float* __restrict__ Y, const float* __restrict__ bias, size_t M, size_t D_out) {
     size_t total = M * D_out;
@@ -131,16 +183,31 @@ Tensor linear_cuda(const Tensor& X, const Tensor& W, const Tensor* bias) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    CUBLAS_CHECK(cublasSgemm(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        static_cast<int>(D_out), static_cast<int>(M), static_cast<int>(D_in),
-        &alpha,
-        W.data<float>(), static_cast<int>(D_in),
-        X.data<float>(), static_cast<int>(D_in),
-        &beta,
-        Y.data<float>(), static_cast<int>(D_out)
-    ));
+    void* Wbf = bf16_mirror_of((const void*)W.data<float>());
+    if (Wbf) {
+        void* Xbf = bf16_cast_tmp(X.data<float>(), M * D_in);
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            static_cast<int>(D_out), static_cast<int>(M), static_cast<int>(D_in),
+            &alpha,
+            Wbf, CUDA_R_16BF, static_cast<int>(D_in),
+            Xbf, CUDA_R_16BF, static_cast<int>(D_in),
+            &beta,
+            Y.data<float>(), CUDA_R_32F, static_cast<int>(D_out),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUDACachingAllocator::instance().deallocate(Xbf);
+    } else {
+        CUBLAS_CHECK(cublasSgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            static_cast<int>(D_out), static_cast<int>(M), static_cast<int>(D_in),
+            &alpha,
+            W.data<float>(), static_cast<int>(D_in),
+            X.data<float>(), static_cast<int>(D_in),
+            &beta,
+            Y.data<float>(), static_cast<int>(D_out)
+        ));
+    }
 
     // Adiciona viés se fornecido
     if (bias && bias->is_defined()) {
@@ -181,35 +248,58 @@ void linear_backward_cuda(
     const float beta_dx = 0.0f;
     const float beta_dw = 1.0f; // acumula em dW
 
+    // ---- Precisao mista: usa espelho BF16 de W se existir ----
+    void* Wbf = bf16_mirror_of((const void*)W.data<float>());
+    void* dyb = Wbf ? bf16_cast_tmp(dY.data<float>(), M * D_out) : nullptr;
+
     // dX = dY @ W
-    // dY é [M, D_out] -> dY_col é [D_out, M]
-    // W é [D_out, D_in] -> W_col é [D_in, D_out]
-    // Resultado dX_col é [D_in, M] -> dX em row-major é [M, D_in]
-    CUBLAS_CHECK(cublasSgemm(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        static_cast<int>(D_in), static_cast<int>(M), static_cast<int>(D_out),
-        &alpha,
-        W.data<float>(), static_cast<int>(D_in),
-        dY.data<float>(), static_cast<int>(D_out),
-        &beta_dx,
-        dX.data<float>(), static_cast<int>(D_in)
-    ));
+    if (Wbf) {
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            static_cast<int>(D_in), static_cast<int>(M), static_cast<int>(D_out),
+            &alpha,
+            Wbf, CUDA_R_16BF, static_cast<int>(D_in),
+            dyb, CUDA_R_16BF, static_cast<int>(D_out),
+            &beta_dx,
+            dX.data<float>(), CUDA_R_32F, static_cast<int>(D_in),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    } else {
+        CUBLAS_CHECK(cublasSgemm(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            static_cast<int>(D_in), static_cast<int>(M), static_cast<int>(D_out),
+            &alpha,
+            W.data<float>(), static_cast<int>(D_in),
+            dY.data<float>(), static_cast<int>(D_out),
+            &beta_dx,
+            dX.data<float>(), static_cast<int>(D_in)
+        ));
+    }
 
     // dW += dY^T @ X
-    // Em cuBLAS column-major: dW_col = X_col @ (dY_col)^T
-    // X_col é [D_in, M] (OP_N), dY_col é [D_out, M] (OP_T -> [M, D_out])
-    // Produto: [D_in, D_out] com ld=D_in -> dW row-major [D_out, D_in]!
-    CUBLAS_CHECK(cublasSgemm(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_T,
-        static_cast<int>(D_in), static_cast<int>(D_out), static_cast<int>(M),
-        &alpha,
-        X.data<float>(), static_cast<int>(D_in),
-        dY.data<float>(), static_cast<int>(D_out),
-        &beta_dw,
-        dW.data<float>(), static_cast<int>(D_in)
-    ));
+    if (Wbf) {
+        void* xbf = bf16_cast_tmp(X.data<float>(), M * D_in);
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            static_cast<int>(D_in), static_cast<int>(D_out), static_cast<int>(M),
+            &alpha,
+            xbf, CUDA_R_16BF, static_cast<int>(D_in),
+            dyb, CUDA_R_16BF, static_cast<int>(D_out),
+            &beta_dw,
+            dW.data<float>(), CUDA_R_32F, static_cast<int>(D_in),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUDACachingAllocator::instance().deallocate(xbf);
+    } else {
+        CUBLAS_CHECK(cublasSgemm(
+            handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            static_cast<int>(D_in), static_cast<int>(D_out), static_cast<int>(M),
+            &alpha,
+            X.data<float>(), static_cast<int>(D_in),
+            dY.data<float>(), static_cast<int>(D_out),
+            &beta_dw,
+            dW.data<float>(), static_cast<int>(D_in)
+        ));
+    }
+    if (dyb) CUDACachingAllocator::instance().deallocate(dyb);
 
     if (dbias && dbias->is_defined()) {
         constexpr int threads = 256;

@@ -195,6 +195,7 @@ int main(int argc, char** argv) {
     float best_val_loss = 1e9f;
     auto start_all = std::chrono::high_resolution_clock::now();
 
+    sore::cuda::refresh_bf16_weights(all_params); // inicializa espelhos BF16 dos pesos
     for (size_t step = start_step; step <= pretrain_steps; ++step) {
         auto t0 = std::chrono::high_resolution_clock::now();
         float accum_loss = 0.0f;
@@ -238,6 +239,7 @@ int main(int argc, char** argv) {
             );
         }
         model.zero_grad();
+        sore::cuda::refresh_bf16_weights(all_params); // re-cast espelhos BF16 apos o update
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
