@@ -58,5 +58,65 @@ AdamW::AdamW(std::vector<Tensor*> params, AdamWConfig config)
     }
 }
 
+AdamW::AdamW(std::vector<Tensor*> params, std::vector<Tensor*> grads, AdamWConfig config)
+    : params_(std::move(params)), grads_(std::move(grads)), config_(config) {
+    for (auto* p : params_) {
+        if (!p) continue;
+        exp_avg_.push_back(Tensor::zeros(p->shape(), p->dtype(), p->device()));
+        exp_avg_sq_.push_back(Tensor::zeros(p->shape(), p->dtype(), p->device()));
+    }
+}
+
+void AdamW::step(const std::vector<Tensor*>& grads) {
+    if (grads.size() != params_.size()) {
+        throw std::runtime_error("[AdamW::step] Contagem de gradientes (" +
+                                 std::to_string(grads.size()) + ") difere dos parâmetros (" +
+                                 std::to_string(params_.size()) + ").");
+    }
+
+    step_count_++;
+
+    for (size_t i = 0; i < params_.size(); ++i) {
+        Tensor* p = params_[i];
+        const Tensor* g = grads[i];
+        if (!p || !g || !p->is_defined() || !g->is_defined()) continue;
+
+        if (p->device() == Device::CUDA) {
+            fused_adamw_cuda(
+                *p, *g, exp_avg_[i], exp_avg_sq_[i],
+                config_.lr, config_.beta1, config_.beta2, config_.eps,
+                config_.weight_decay, step_count_
+            );
+        } else {
+            fused_adamw_cpu(
+                *p, *g, exp_avg_[i], exp_avg_sq_[i],
+                config_.lr, config_.beta1, config_.beta2, config_.eps,
+                config_.weight_decay, step_count_
+            );
+        }
+    }
+}
+
+void AdamW::step() {
+    if (grads_.empty()) {
+        throw std::runtime_error("[AdamW::step] Chamado sem lista de gradientes vinculada.");
+    }
+    step(grads_);
+}
+
+void AdamW::zero_grad(std::vector<Tensor*>& grads) {
+    for (auto* g : grads) {
+        if (g && g->is_defined()) {
+            g->zero_();
+        }
+    }
+}
+
+void AdamW::zero_grad() {
+    if (!grads_.empty()) {
+        zero_grad(grads_);
+    }
+}
+
 } // namespace optim
 } // namespace sore

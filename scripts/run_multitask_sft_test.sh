@@ -30,7 +30,7 @@ echo -e "\n[Passo 3/4] Executando SFT Multi-Tarefa (150 passos rápidos)..."
     checkpoints/sore_lm_150m_pretrain.bin \
     data/sft_multitask_test.bin \
     checkpoints/sore_lm_150m_sft_multitask.bin \
-    150 2 256 2>&1 | tee logs/sft_multitask_run.log
+    150 2 256 data/sft_multitask_val.bin 2>&1 | tee logs/sft_multitask_run.log
 
 # 4. Avaliação Comparativa Automatizada
 echo -e "\n[Passo 4/4] Avaliando modelo pós-SFT Multi-Tarefa..."

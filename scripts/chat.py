@@ -8,8 +8,9 @@ Implementa Conv1D, RG-LRU, GELU MLP, Weight Tying e Amostragem com Repetition Pe
 import os
 import sys
 import argparse
+import struct
 import numpy as np
-import tiktoken
+from tokenizer_utils import get_tokenizer
 
 class StackedRNNGenerator:
     def __init__(
@@ -20,20 +21,43 @@ class StackedRNNGenerator:
         num_layers: int = 12,
         d_mlp: int = 2560,
         conv_kernel: int = 4,
-        eps: float = 1e-5
+        eps: float = 1e-5,
+        tokenizer_name: str = "pt"
     ):
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.d_mlp = d_mlp
-        self.conv_kernel = conv_kernel
-        self.eps = eps
-        self.enc = tiktoken.get_encoding("gpt2")
-
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint não encontrado em: {checkpoint_path}")
 
-        raw = np.fromfile(checkpoint_path, dtype=np.float32)
+        self.tokenizer_name = tokenizer_name
+        self.eps = eps
+
+        with open(checkpoint_path, "rb") as f:
+            magic = f.read(4)
+            if magic == b"SORE":
+                (version, header_size, v_size, d_m, n_l, d_m_mlp, c_k, tie, eps_val,
+                 step, tokens, cursor, lr, has_opt, num_p) = struct.unpack("<IIIIIIII f QQQ f II", f.read(68))
+                vocab_size = v_size
+                d_model = d_m
+                num_layers = n_l
+                d_mlp = d_m_mlp
+                conv_kernel = c_k
+                eps = eps_val
+                print(f"[soreRNN-LM] Header SORE v{version} detectado: L={num_layers}, D={d_model}, MLP={d_mlp}, Passo={step}")
+                f.seek(header_size)
+                raw = np.fromfile(f, dtype=np.float32)
+            else:
+                f.seek(0)
+                file_size_bytes = os.path.getsize(checkpoint_path)
+                total_floats = file_size_bytes // 4
+                if d_model == 1024 and num_layers == 12:
+                    if total_floats > 250_000_000:
+                        d_model = 1280
+                        num_layers = 18
+                        d_mlp = 3200
+                    else:
+                        d_model = 1024
+                        num_layers = 12
+                        d_mlp = 2560
+                raw = np.fromfile(f, dtype=np.float32)
         offset = 0
 
         def read_tensor(shape):
@@ -73,10 +97,13 @@ class StackedRNNGenerator:
             }
             self.layers.append(layer)
 
+        self.enc = get_tokenizer(self.tokenizer_name)
+
         print(f"[soreRNN-LM v2] Checkpoint carregado: {checkpoint_path}")
         print(f" -> Arquitetura: {num_layers} camadas | d_model={d_model} | d_mlp={d_mlp} | K={conv_kernel}")
         print(f" -> Weight Tying: Sim (w_head compartilhado com w_emb)")
         print(f" -> Parâmetros lidos: {offset:,} floats (~{offset * 4 / (1024*1024):.2f} MB)")
+        print(f" -> Tokenizer: {self.tokenizer_name} (vocab={self.enc.vocab_size})")
 
     def rms_norm(self, x: np.ndarray, gamma: np.ndarray) -> np.ndarray:
         rms = np.sqrt(np.mean(x ** 2) + self.eps)
@@ -217,7 +244,6 @@ class StackedRNNGenerator:
         generated_tokens = []
         current_tok = tokens[-1] if tokens else 0
         all_tokens = list(tokens)
-
         for _ in range(max_new_tokens):
             if logits is None:
                 logits, h_states, conv_buffers = self.step(current_tok, h_states, conv_buffers)
@@ -235,8 +261,7 @@ class StackedRNNGenerator:
 
             word = self.enc.decode([next_tok])
             print(word, end="", flush=True)
-
-            if word in ["<|endoftext|>", "<|user|>", "\n\n"]:
+            if "<|endoftext|>" in word or "<|user|>" in word or "</s>" in word:
                 break
 
             current_tok = next_tok
@@ -247,10 +272,10 @@ class StackedRNNGenerator:
 
 def interactive_chat(checkpoint_path: str):
     bot = StackedRNNGenerator(checkpoint_path)
-    is_pretrain = "pretrain" in checkpoint_path
-    mode_name = "Base Pretrain (Completador de Raciocínio)" if is_pretrain else "SFT Instruído (Chatbot)"
+    is_sft = "sft" in checkpoint_path.lower()
+    mode_name = "SFT Instruído (Chatbot)" if is_sft else "Base Pretrain (Completador de Texto e Raciocínio)"
     print("\n" + "=" * 65)
-    print(f"  CHAT INTERATIVO - soreRNN-LM v2 ({mode_name})")
+    print(f"  CHAT INTERATIVO - soreRNN-LM ({mode_name})")
     print("  (Digite 'sair' para encerrar)")
     print("=" * 65 + "\n")
 
@@ -263,34 +288,51 @@ def interactive_chat(checkpoint_path: str):
                 print("Até mais!")
                 break
 
-            if is_pretrain:
-                if user_input.startswith("Problema:") or user_input.startswith("Pergunta:"):
-                    formatted_prompt = user_input + "\nRaciocínio:"
+            if not is_sft:
+                if any(kw in user_input.lower() for kw in ["calcule", "quanto", "problema", "some", "multiplique"]):
+                    if not user_input.startswith("Problema:"):
+                        formatted_prompt = f"Problema: {user_input}\nRaciocínio:"
+                    else:
+                        formatted_prompt = user_input + "\nRaciocínio:"
+                    print("soreRNN [Raciocínio]: ", end="", flush=True)
                 else:
-                    formatted_prompt = f"Problema: {user_input}\nRaciocínio:"
-                print("soreRNN [Raciocínio]: ", end="", flush=True)
+                    formatted_prompt = user_input
+                    print("soreRNN [Completando]: ", end="", flush=True)
             else:
                 formatted_prompt = f"<|user|>\n{user_input}\n<|assistant|>\n"
                 print("soreRNN: ", end="", flush=True)
 
-            bot.generate(formatted_prompt, max_new_tokens=60, temperature=0.3, repetition_penalty=1.15)
+            bot.generate(formatted_prompt, max_new_tokens=80, temperature=0.7, repetition_penalty=1.15)
             print()
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando...")
             break
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Inferência da soreRNN-LM v2")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/sore_lm_150m_final.bin")
+    parser = argparse.ArgumentParser(description="Inferência da soreRNN-LM")
+    default_ckpt = "checkpoints/sore_lm_300m_final.bin"
+    if not os.path.exists(default_ckpt):
+        default_ckpt = "checkpoints/sore_lm_150m_final.bin"
+    if not os.path.exists(default_ckpt):
+        default_ckpt = "checkpoints/sore_lm_300m_pretrain.bin"
+
+    parser.add_argument("--checkpoint", type=str, default=default_ckpt)
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--max_tokens", type=int, default=60)
+    parser.add_argument("--max_tokens", type=int, default=80)
     parser.add_argument("--temp", type=float, default=0.7)
     parser.add_argument("--rep_penalty", type=float, default=1.15)
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
-        if os.path.exists("checkpoints/sore_lm_150m_pretrain.bin"):
-            args.checkpoint = "checkpoints/sore_lm_150m_pretrain.bin"
+        for fallback in [
+            "checkpoints/sore_lm_300m_final.bin",
+            "checkpoints/sore_lm_300m_pretrain.bin",
+            "checkpoints/sore_lm_150m_final.bin",
+            "checkpoints/sore_lm_150m_pretrain.bin",
+        ]:
+            if os.path.exists(fallback):
+                args.checkpoint = fallback
+                break
 
     if args.prompt:
         bot = StackedRNNGenerator(args.checkpoint)

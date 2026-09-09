@@ -18,7 +18,7 @@ def run_tests():
         return
 
     print("=" * 70)
-    print(f"  AVALIAÇÃO COGNITIVA DO soreRNN-LM v2 (NVIDIA L40S 48GB)")
+    print(f"  AVALIAÇÃO COGNITIVA DO soreRNN-LM v2 (GPU ACELERADA)")
     print(f"  Checkpoint: {ckpt}")
     print("=" * 70)
 

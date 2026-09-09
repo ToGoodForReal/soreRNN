@@ -131,7 +131,7 @@ void test_stacked_rnn_150m_config() {
 }
 
 void test_forward_backward_pass() {
-    std::cout << "[Test 4/4] Teste de Forward & Backward Completo na GPU L40S..." << std::endl;
+    std::cout << "[Test 4/4] Teste de Forward & Backward Completo na GPU CUDA..." << std::endl;
     sore::nn::StackedRNNConfig config;
     config.vocab_size = 1000; // vocabulário reduzido para teste rápido
     config.d_model = 64;

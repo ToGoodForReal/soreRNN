@@ -54,6 +54,10 @@ public:
     [[nodiscard]] bool has_next() const noexcept;
     Batch next();
     void reset() noexcept { current_cursor_ = 0; }
+    [[nodiscard]] size_t cursor() const noexcept { return current_cursor_; }
+    void set_cursor(size_t cursor) noexcept { current_cursor_ = cursor; }
+    [[nodiscard]] size_t batch_size() const noexcept { return batch_size_; }
+    [[nodiscard]] size_t seq_len() const noexcept { return seq_len_; }
 
     [[nodiscard]] size_t total_batches() const noexcept;
 

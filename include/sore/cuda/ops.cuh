@@ -2,6 +2,7 @@
 
 #include "sore/core/tensor.hpp"
 #include "sore/cuda/cublas_handle.hpp"
+#include <string>
 
 namespace sore {
 namespace cuda {
@@ -224,6 +225,33 @@ void sparse_attention_backward_cuda(
     size_t D,
     size_t window_size = 256
 );
+
+/**
+ * @brief Estrutura com metadados do hardware da GPU detectada.
+ */
+struct GpuDeviceInfo {
+    std::string name = "Unknown GPU";
+    int major = 0;
+    int minor = 0;
+    size_t total_memory_mb = 0;
+    size_t free_memory_mb = 0;
+    int sm_count = 0;
+};
+
+/**
+ * @brief Obtém informações detalhadas da GPU ativa via CUDA Runtime.
+ */
+GpuDeviceInfo get_gpu_device_info(int device_id = 0);
+
+/**
+ * @brief Imprime diagnóstico completo de hardware da GPU no console.
+ */
+void print_gpu_info(int device_id = 0);
+
+/**
+ * @brief Escala in-place um tensor na GPU por um escalar float: t = t * scale
+ */
+void scale_tensor_cuda(Tensor& t, float scale);
 
 } // namespace cuda
 } // namespace sore

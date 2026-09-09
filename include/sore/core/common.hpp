@@ -56,10 +56,44 @@ inline std::string to_string(DType dtype) {
         }                                                                      \
     } while (0)
 
-// Verificação de erro assíncrono após lançamento de kernel CUDA
-#define CUDA_SYNC_CHECK()                                                      \
+namespace cuda {
+inline bool is_sync_debug_enabled() {
+    static bool checked = false;
+    static bool enabled = false;
+    if (!checked) {
+        const char* env = std::getenv("SORE_SYNC_DEBUG");
+        enabled = (env != nullptr && std::string(env) != "0");
+        checked = true;
+    }
+    return enabled;
+}
+
+inline void synchronize() {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss << "[CUDA Error] " << cudaGetErrorString(err)
+            << " at device synchronize";
+        throw std::runtime_error(oss.str());
+    }
+}
+} // namespace cuda
+
+// Verificação de lançamento de kernel CUDA (assíncrona: sem stall do host por padrão)
+#define CUDA_POST_KERNEL_CHECK()                                               \
     do {                                                                       \
         CUDA_CHECK(cudaGetLastError());                                        \
+        if (::sore::cuda::is_sync_debug_enabled()) {                           \
+            CUDA_CHECK(cudaDeviceSynchronize());                               \
+        }                                                                      \
+    } while (0)
+
+// Macro de compatibilidade: por padrão não faz stall de GPU/CPU, pipeline segue assíncrono
+#define CUDA_SYNC_CHECK() CUDA_POST_KERNEL_CHECK()
+
+// Sincronização explícita sob demanda do dispositivo GPU
+#define CUDA_DEVICE_SYNC()                                                     \
+    do {                                                                       \
         CUDA_CHECK(cudaDeviceSynchronize());                                   \
     } while (0)
 

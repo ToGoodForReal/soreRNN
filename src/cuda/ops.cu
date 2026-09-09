@@ -1,7 +1,10 @@
 #include "sore/cuda/ops.cuh"
+#include "sore/cuda/caching_allocator.hpp"
 #include <algorithm>
 #include <stdexcept>
 #include <sstream>
+#include <iostream>
+#include <iomanip>
 
 namespace sore {
 namespace cuda {
@@ -247,9 +250,8 @@ Tensor embedding_forward_cuda(
 
     Tensor out({B, T, D}, DType::Float32, Device::CUDA);
 
-    // Aloca buffer temporário na GPU para os tokens
-    uint16_t* d_tokens = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_tokens, N * sizeof(uint16_t)));
+    // Aloca buffer temporário na GPU via Caching Allocator (zero overhead de driver)
+    uint16_t* d_tokens = static_cast<uint16_t*>(CUDACachingAllocator::instance().allocate(N * sizeof(uint16_t)));
     CUDA_CHECK(cudaMemcpy(d_tokens, tokens.data(), N * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
     constexpr int threads = 256;
@@ -259,7 +261,7 @@ Tensor embedding_forward_cuda(
         d_tokens, weight.data<float>(), out.data<float>(), total, D, V
     );
     CUDA_SYNC_CHECK();
-    CUDA_CHECK(cudaFree(d_tokens));
+    CUDACachingAllocator::instance().deallocate(d_tokens);
 
     return out;
 }
@@ -293,8 +295,7 @@ void embedding_backward_cuda(
     size_t V = d_weight.dim(0);
     size_t total = N * D;
 
-    uint16_t* d_tokens = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_tokens, N * sizeof(uint16_t)));
+    uint16_t* d_tokens = static_cast<uint16_t*>(CUDACachingAllocator::instance().allocate(N * sizeof(uint16_t)));
     CUDA_CHECK(cudaMemcpy(d_tokens, tokens.data(), N * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
     constexpr int threads = 256;
@@ -304,7 +305,7 @@ void embedding_backward_cuda(
         d_tokens, d_out.data<float>(), d_weight.data<float>(), total, D, V
     );
     CUDA_SYNC_CHECK();
-    CUDA_CHECK(cudaFree(d_tokens));
+    CUDACachingAllocator::instance().deallocate(d_tokens);
 }
 
 __global__ void cross_entropy_cuda_kernel(
@@ -413,10 +414,8 @@ float cross_entropy_loss_and_grad_cuda(
     }
     float inv_active_n = active_count > 0 ? (1.0f / static_cast<float>(active_count)) : 0.0f;
 
-    uint16_t* d_targets = nullptr;
-    float* d_losses = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_targets, N * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_losses, N * sizeof(float)));
+    uint16_t* d_targets = static_cast<uint16_t*>(CUDACachingAllocator::instance().allocate(N * sizeof(uint16_t)));
+    float* d_losses = static_cast<float*>(CUDACachingAllocator::instance().allocate(N * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_targets, targets.data(), N * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
     constexpr int threads = 256;
@@ -431,8 +430,8 @@ float cross_entropy_loss_and_grad_cuda(
     std::vector<float> h_losses(N);
     CUDA_CHECK(cudaMemcpy(h_losses.data(), d_losses, N * sizeof(float), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaFree(d_targets));
-    CUDA_CHECK(cudaFree(d_losses));
+    CUDACachingAllocator::instance().deallocate(d_targets);
+    CUDACachingAllocator::instance().deallocate(d_losses);
 
     double sum = 0.0;
     for (size_t i = 0; i < N; ++i) {
@@ -586,22 +585,22 @@ void rmsnorm_backward_cuda(
     CUDA_SYNC_CHECK();
 }
 
-__global__ void sum_sq_kernel(const float* __restrict__ data, float* __restrict__ result, size_t n) {
+__global__ void sum_sq_kernel(const float* __restrict__ data, double* __restrict__ result, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float thread_sum = 0.0f;
+    double thread_sum = 0.0;
     for (size_t i = idx; i < n; i += blockDim.x * gridDim.x) {
-        float v = data[i];
+        double v = static_cast<double>(data[i]);
         thread_sum += v * v;
     }
-    extern __shared__ float sdata[];
-    sdata[threadIdx.x] = thread_sum;
+    extern __shared__ double sdata_d[];
+    sdata_d[threadIdx.x] = thread_sum;
     __syncthreads();
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        if (threadIdx.x < s) sdata_d[threadIdx.x] += sdata_d[threadIdx.x + s];
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        atomicAdd(result, sdata[0]);
+        atomicAdd(result, sdata_d[0]);
     }
 }
 
@@ -612,26 +611,37 @@ __global__ void scale_tensor_kernel(float* __restrict__ data, float scale, size_
     }
 }
 
+void scale_tensor_cuda(Tensor& t, float scale) {
+    if (t.device() != Device::CUDA) {
+        throw std::runtime_error("scale_tensor_cuda requer tensor na GPU.");
+    }
+    size_t n = t.numel();
+    if (n == 0) return;
+    constexpr int threads = 256;
+    int blocks = static_cast<int>(std::min((n + threads - 1) / threads, size_t(1024)));
+    scale_tensor_kernel<<<blocks, threads>>>(t.data<float>(), scale, n);
+    CUDA_SYNC_CHECK();
+}
+
 float clip_grad_norm_cuda(std::vector<Tensor*>& grads, float max_norm) {
-    float* d_sum_sq = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_sum_sq, sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_sum_sq, 0, sizeof(float)));
+    double* d_sum_sq = static_cast<double*>(CUDACachingAllocator::instance().allocate(sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_sum_sq, 0, sizeof(double)));
 
     constexpr int threads = 256;
     for (auto* g : grads) {
         if (!g || !g->is_defined() || g->numel() == 0) continue;
         size_t n = g->numel();
         int blocks = static_cast<int>(std::min((n + threads - 1) / threads, size_t(1024)));
-        size_t smem = threads * sizeof(float);
+        size_t smem = threads * sizeof(double);
         sum_sq_kernel<<<blocks, threads, smem>>>(g->data<float>(), d_sum_sq, n);
     }
     CUDA_SYNC_CHECK();
 
-    float h_sum_sq = 0.0f;
-    CUDA_CHECK(cudaMemcpy(&h_sum_sq, d_sum_sq, sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_sum_sq));
+    double h_sum_sq = 0.0;
+    CUDA_CHECK(cudaMemcpy(&h_sum_sq, d_sum_sq, sizeof(double), cudaMemcpyDeviceToHost));
+    CUDACachingAllocator::instance().deallocate(d_sum_sq);
 
-    float total_norm = std::sqrt(h_sum_sq);
+    float total_norm = static_cast<float>(std::sqrt(h_sum_sq));
     if (total_norm > max_norm) {
         float scale = max_norm / (total_norm + 1e-6f);
         for (auto* g : grads) {
@@ -949,7 +959,9 @@ void swiglu_backward_cuda(
 }
 
 // ==============================================================================
-//  Gated DeltaNet (Delta Rule Linear Recurrent Attention)
+//  [EXPERIMENTAL / WIP] Gated DeltaNet (Canal Escalar Experimental)
+//  Nota: Módulo de pesquisa desacoplado do StackedLinearRNNLM (o modelo oficial
+//  utiliza RG-LRU + Causal Depthwise Conv1D + GELU MLP).
 // ==============================================================================
 
 __global__ void gated_deltanet_forward_kernel(
@@ -1115,7 +1127,8 @@ void gated_deltanet_backward_cuda(
 }
 
 // ==============================================================================
-//  Qwen Sparse Attention (Sliding Window Causal Attention, W=256)
+//  [EXPERIMENTAL / WIP] Qwen Sparse Attention (Sliding Window Local Attention)
+//  Nota: Módulo experimental de canal local desacoplado do modelo principal.
 // ==============================================================================
 
 __global__ void sparse_attention_forward_kernel(
@@ -1268,6 +1281,41 @@ void sparse_attention_backward_cuda(
         B, T, D, window_size
     );
     CUDA_SYNC_CHECK();
+}
+
+GpuDeviceInfo get_gpu_device_info(int device_id) {
+    GpuDeviceInfo info;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+        info.name = prop.name;
+        info.major = prop.major;
+        info.minor = prop.minor;
+        info.sm_count = prop.multiProcessorCount;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        info.free_memory_mb = free_bytes / (1024 * 1024);
+        info.total_memory_mb = total_bytes / (1024 * 1024);
+    } else if (prop.totalGlobalMem > 0) {
+        info.total_memory_mb = prop.totalGlobalMem / (1024 * 1024);
+    }
+    return info;
+}
+
+void print_gpu_info(int device_id) {
+    GpuDeviceInfo info = get_gpu_device_info(device_id);
+    std::cout << "=================================================================\n"
+              << "              DIAGNÓSTICO DE HARDWARE DA GPU ACELERADORA          \n"
+              << "=================================================================\n"
+              << " -> Dispositivo: " << info.name << "\n"
+              << " -> Arquitetura / Compute Capability: sm_" << info.major << info.minor
+              << " (" << info.major << "." << info.minor << ")\n"
+              << " -> Streaming Multiprocessors (SMs): " << info.sm_count << "\n"
+              << " -> VRAM Total: " << info.total_memory_mb << " MB ("
+              << std::fixed << std::setprecision(1) << (static_cast<double>(info.total_memory_mb) / 1024.0) << " GB)\n"
+              << " -> VRAM Livre Estimada: " << info.free_memory_mb << " MB\n"
+              << "=================================================================" << std::endl;
 }
 
 } // namespace cuda

@@ -57,7 +57,7 @@ void test_tensor_zero_copy_view() {
 }
 
 void test_tensor_h2d_d2h_transfer() {
-    std::cout << "[Test] Transferência Bidirecional Host (CPU) <-> Device (GPU L40S)..." << std::endl;
+    std::cout << "[Test] Transferência Bidirecional Host (CPU) <-> Device (GPU CUDA)..." << std::endl;
     
     // 1. Criar e popular no Host
     constexpr size_t N = 1024;

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 static float compute_lr(size_t step, size_t warmup_steps, size_t total_steps, float max_lr, float min_lr) {
@@ -29,6 +30,7 @@ int main(int argc, char** argv) {
     size_t sft_steps = 200;
     size_t batch_size = 2;
     size_t seq_len = 256;
+    std::string val_dataset = "data/sft_val.bin";
 
     if (argc > 1) in_ckpt = argv[1];
     if (argc > 2) sft_dataset = argv[2];
@@ -36,6 +38,10 @@ int main(int argc, char** argv) {
     if (argc > 4) sft_steps = std::stoul(argv[4]);
     if (argc > 5) batch_size = std::stoul(argv[5]);
     if (argc > 6) seq_len = std::stoul(argv[6]);
+    if (argc > 7) val_dataset = argv[7];
+    else if (!std::filesystem::exists(val_dataset) && std::filesystem::exists("data/sft_multitask_val.bin")) {
+        val_dataset = "data/sft_multitask_val.bin";
+    }
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "   soreRNN-LM v2: TESTE DE SFT MULTI-TAREFA (CONVERSA + MATH CoT)" << std::endl;
@@ -58,17 +64,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 1. Configurar Arquitetura soreRNN-LM v2
+    // 1. Configurar Arquitetura soreRNN-LM (Auto-detecção 300M vs 150M)
     sore::nn::StackedRNNConfig config;
     config.vocab_size = 50257;
-    config.d_model = 1024;
-    config.num_layers = 12;
-    config.d_mlp = 2560;
     config.conv_kernel = 4;
     config.tie_weights = true;
     config.device = sore::Device::CUDA;
 
-    std::cout << "[1/4] Carregando modelo base..." << std::endl;
+    std::ifstream ifs(in_ckpt, std::ios::binary);
+    char magic[4]{0};
+    ifs.read(magic, 4);
+    if (magic[0] == 'S' && magic[1] == 'O' && magic[2] == 'R' && magic[3] == 'E') {
+        ifs.seekg(0, std::ios::beg);
+        sore::nn::CheckpointHeader header;
+        ifs.read(reinterpret_cast<char*>(&header), sizeof(sore::nn::CheckpointHeader));
+        config.d_model = header.d_model;
+        config.num_layers = header.num_layers;
+        config.d_mlp = header.d_mlp;
+        config.conv_kernel = header.conv_kernel;
+        config.vocab_size = header.vocab_size;
+        std::cout << "[1/4] Header SORE v" << header.version << " detectado no checkpoint: L=" 
+                  << config.num_layers << ", D=" << config.d_model << ", MLP=" << config.d_mlp << std::endl;
+    } else {
+        uintmax_t ckpt_bytes = std::filesystem::file_size(in_ckpt);
+        if (ckpt_bytes > 1000000000ULL) {
+            config.d_model = 1280;
+            config.num_layers = 18;
+            config.d_mlp = 3200;
+            std::cout << "[1/4] Detectada arquitetura soreRNN 300M (legado: 18 camadas, D=1280, d_mlp=3200)..." << std::endl;
+        } else {
+            config.d_model = 1024;
+            config.num_layers = 12;
+            config.d_mlp = 2560;
+            std::cout << "[1/4] Detectada arquitetura soreRNN 150M (legado: 12 camadas, D=1024, d_mlp=2560)..." << std::endl;
+        }
+    }
+
     sore::nn::StackedLinearRNNLM model(config);
     model.load_checkpoint(in_ckpt);
 
@@ -90,6 +121,14 @@ int main(int argc, char** argv) {
     sore::data::DataLoader sft_loader(sft_ds, batch_size, seq_len, true);
     std::cout << " -> Total de tokens no dataset SFT: " << sft_ds->total_tokens() / 2 << " pares (Tokens + Máscaras)" << std::endl;
 
+    std::shared_ptr<sore::data::DataLoader> val_loader = nullptr;
+    if (std::filesystem::exists(val_dataset)) {
+        auto val_ds = std::make_shared<sore::data::MMapDataset>(val_dataset);
+        val_loader = std::make_shared<sore::data::DataLoader>(val_ds, batch_size, seq_len, true);
+        std::cout << " -> Validação SFT Held-out ativa: " << val_ds->total_tokens() / 2 
+                  << " pares (" << val_dataset << ")" << std::endl;
+    }
+
     // 4. Loop de SFT
     std::cout << "\n[4/4] Executando Fine-Tuning Multi-Tarefa..." << std::endl;
     float max_lr = 5e-5f;
@@ -97,6 +136,9 @@ int main(int argc, char** argv) {
     float weight_decay = 0.01f;
     size_t tokens_per_batch = batch_size * seq_len;
     size_t total_tokens_trained = 0;
+    float best_val_loss = 1e9f;
+    size_t patience_counter = 0;
+    constexpr size_t max_patience = 4;
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -144,9 +186,27 @@ int main(int argc, char** argv) {
                       << " | " << std::fixed << std::setprecision(0) << speed << " tok/s" << std::endl;
         }
 
-        if (loss < 0.6f && step >= 50) {
-            std::cout << " -> Loss ideal de SFT atingida (" << loss << "). Parando para evitar sobreajuste." << std::endl;
-            break;
+        // Validação Periódica no conjunto Held-out
+        if (val_loader && (step % 20 == 0 || step == sft_steps)) {
+            float val_loss = model.evaluate(*val_loader, 10);
+            float val_ppl = std::exp(std::min(val_loss, 20.0f));
+            std::cout << " >>> [SFT VALIDAÇÃO] Val Loss: " << std::fixed << std::setprecision(4) << val_loss
+                      << " | Val PPL: " << std::setprecision(2) << val_ppl << std::endl;
+
+            if (val_loss < best_val_loss) {
+                best_val_loss = val_loss;
+                patience_counter = 0;
+                std::string best_out = out_ckpt + ".best.bin";
+                model.save_checkpoint(best_out);
+                std::cout << " -> Melhor modelo SFT salvo em: " << best_out << " (val_loss=" << val_loss << ")" << std::endl;
+            } else if (step >= 50) {
+                patience_counter++;
+                if (patience_counter >= max_patience) {
+                    std::cout << " -> Early stopping: Validação estagnou por " << max_patience 
+                              << " avaliações consecutivas. Encerrando para prevenir sobreajuste." << std::endl;
+                    break;
+                }
+            }
         }
     }
 

@@ -202,7 +202,7 @@ def generate_sft_dialogues(count=15000):
         ("Bom dia!", "Bom dia! Em que posso ser útil para você nesta manhã?"),
         ("Boa tarde!", "Boa tarde! Como posso auxiliar em seus estudos e tarefas?"),
         ("Quem é você?", "Sou o soreRNN-LM v2, uma inteligência artificial recorrente linear desenvolvida com tecnologia C++20 e CUDA de alto desempenho."),
-        ("Como você funciona?", "Eu processo linguagem natural através de uma arquitetura híbrida com convolução 1D, Gated DeltaNet em tempo O(1) e camadas MLP SwiGLU."),
+        ("Como você funciona?", "Eu processo linguagem natural através de uma arquitetura recorrente linear com convolução causal 1D, RG-LRU (Real-Gated Linear Recurrent Unit) com geração O(1) por token e blocos MLP com ativação GELU."),
     ]
 
     tarefas_conversacionais = [

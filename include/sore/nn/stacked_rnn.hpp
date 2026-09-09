@@ -7,9 +7,47 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdint>
 
 namespace sore {
+namespace data {
+    class DataLoader;
+}
+
 namespace nn {
+
+#pragma pack(push, 1)
+struct CheckpointHeader {
+    char magic[4]{'S', 'O', 'R', 'E'};
+    uint32_t version{2};
+    uint32_t header_size{sizeof(CheckpointHeader)};
+    uint32_t vocab_size{50257};
+    uint32_t d_model{1024};
+    uint32_t num_layers{12};
+    uint32_t d_mlp{2560};
+    uint32_t conv_kernel{4};
+    uint32_t tie_weights{1};
+    float eps{1e-5f};
+    uint64_t step{0};
+    uint64_t total_trained_tokens{0};
+    uint64_t dataloader_cursor{0};
+    float current_lr{0.0f};
+    uint32_t has_optimizer_state{0};
+    uint32_t num_param_tensors{0};
+    uint64_t total_params{0};
+    uint8_t reserved[32]{0};
+};
+#pragma pack(pop)
+
+struct TrainingState {
+    uint64_t step{0};
+    uint64_t total_trained_tokens{0};
+    uint64_t dataloader_cursor{0};
+    float current_lr{0.0f};
+    bool has_optimizer{false};
+    std::vector<Tensor> exp_avg;
+    std::vector<Tensor> exp_avg_sq;
+};
 
 struct StackedRNNConfig {
     size_t vocab_size{50257};
@@ -119,12 +157,16 @@ public:
     std::vector<Tensor*> parameters();
     std::vector<Tensor*> gradients();
 
-    // Salvamento e carregamento de checkpoints binários
-    void save_checkpoint(const std::string& filepath) const;
-    void load_checkpoint(const std::string& filepath);
+    // Salvamento e carregamento de checkpoints binários com header estruturado
+    void save_checkpoint(const std::string& filepath, const TrainingState* state = nullptr) const;
+    bool load_checkpoint(const std::string& filepath, TrainingState* state = nullptr);
+
+    // Avaliação de perda (Cross-Entropy) em lote de validação (held-out)
+    float evaluate(data::DataLoader& val_loader, size_t max_batches = 0);
 
     [[nodiscard]] const StackedRNNConfig& config() const noexcept { return config_; }
     [[nodiscard]] size_t total_parameters() const noexcept;
+    [[nodiscard]] size_t num_parameter_tensors() const noexcept { return 3 + 14 * config_.num_layers; }
 
 private:
     StackedRNNConfig config_;

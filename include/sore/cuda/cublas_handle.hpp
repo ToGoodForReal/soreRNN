@@ -26,8 +26,8 @@ public:
 private:
     CublasHandle() {
         CUBLAS_CHECK(cublasCreate(&handle_));
-        // Configura modo de matemática determinística / padrão
-        CUBLAS_CHECK(cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH));
+        // Configura aceleração por Tensor Cores Ampere (TF32) para maior throughput
+        CUBLAS_CHECK(cublasSetMathMode(handle_, CUBLAS_TF32_TENSOR_OP_MATH));
     }
 
     ~CublasHandle() {

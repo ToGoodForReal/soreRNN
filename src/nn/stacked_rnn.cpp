@@ -1,9 +1,12 @@
 #include "sore/nn/stacked_rnn.hpp"
+#include "sore/data/dataloader.hpp"
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <cmath>
+#include <algorithm>
 #include <stdexcept>
+#include <sstream>
 #include <filesystem>
 
 namespace sore {
@@ -114,7 +117,28 @@ void StackedLinearRNNLM::init_weights(uint64_t seed) {
         fill_val(layers_[l].b_conv, 0.0f);
 
         init_tensor(layers_[l].w_gate);
-        fill_val(layers_[l].b_gate, 0.0f);
+        // Inicialização de Gates de Decaimento com Multi-Escala Temporal (Griffin/LRU)
+        // Evita que o modelo nasça com decay=0.5 (esquecimento rápido) e cria
+        // horizontes de memória de curto, médio e longo alcance (5 a 500+ tokens).
+        {
+            Tensor cpu_bg(layers_[l].b_gate.shape(), DType::Float32, Device::CPU);
+            float* bg_ptr = cpu_bg.data<float>();
+            size_t D = config_.d_model;
+            for (size_t i = 0; i < D; ++i) {
+                float frac = static_cast<float>(i) / static_cast<float>(D > 1 ? D - 1 : 1);
+                float log_tau_min = std::log(5.0f);    // memória mínima: ~5 tokens
+                float log_tau_max = std::log(500.0f);  // memória máxima: ~500 tokens
+                float tau = std::exp(log_tau_min + frac * (log_tau_max - log_tau_min));
+                float lambda_val = 1.0f - (1.0f / tau);
+                lambda_val = std::clamp(lambda_val, 0.01f, 0.999f);
+                bg_ptr[i] = std::log(lambda_val / (1.0f - lambda_val));
+            }
+            if (layers_[l].b_gate.device() == Device::CUDA) {
+                layers_[l].b_gate = cpu_bg.cuda();
+            } else {
+                layers_[l].b_gate = cpu_bg;
+            }
+        }
         init_tensor(layers_[l].w_in);
         fill_val(layers_[l].b_in, 0.0f);
         init_tensor(layers_[l].w_out, residual_scale);
@@ -363,12 +387,36 @@ size_t StackedLinearRNNLM::total_parameters() const noexcept {
     return count;
 }
 
-void StackedLinearRNNLM::save_checkpoint(const std::string& filepath) const {
+void StackedLinearRNNLM::save_checkpoint(const std::string& filepath, const TrainingState* state) const {
     std::filesystem::create_directories(std::filesystem::path(filepath).parent_path());
     std::ofstream ofs(filepath, std::ios::binary);
     if (!ofs.is_open()) {
         throw std::runtime_error("Não foi possível salvar checkpoint em: " + filepath);
     }
+
+    CheckpointHeader header;
+    header.magic[0] = 'S'; header.magic[1] = 'O'; header.magic[2] = 'R'; header.magic[3] = 'E';
+    header.version = 2;
+    header.header_size = sizeof(CheckpointHeader);
+    header.vocab_size = static_cast<uint32_t>(config_.vocab_size);
+    header.d_model = static_cast<uint32_t>(config_.d_model);
+    header.num_layers = static_cast<uint32_t>(config_.num_layers);
+    header.d_mlp = static_cast<uint32_t>(config_.d_mlp);
+    header.conv_kernel = static_cast<uint32_t>(config_.conv_kernel);
+    header.tie_weights = config_.tie_weights ? 1 : 0;
+    header.eps = config_.eps;
+    header.num_param_tensors = static_cast<uint32_t>(num_parameter_tensors());
+    header.total_params = total_parameters();
+
+    if (state != nullptr) {
+        header.step = state->step;
+        header.total_trained_tokens = state->total_trained_tokens;
+        header.dataloader_cursor = state->dataloader_cursor;
+        header.current_lr = state->current_lr;
+        header.has_optimizer_state = (state->has_optimizer && !state->exp_avg.empty()) ? 1 : 0;
+    }
+
+    ofs.write(reinterpret_cast<const char*>(&header), sizeof(CheckpointHeader));
 
     auto save_tensor = [&](const Tensor& t) {
         Tensor cpu_t = (t.device() == Device::CUDA) ? t.cpu() : t;
@@ -396,12 +444,78 @@ void StackedLinearRNNLM::save_checkpoint(const std::string& filepath) const {
         save_tensor(layers_[l].w_mlp2);
         save_tensor(layers_[l].b_mlp2);
     }
+
+    if (header.has_optimizer_state && state != nullptr) {
+        uint32_t num_opt_tensors = static_cast<uint32_t>(state->exp_avg.size());
+        ofs.write(reinterpret_cast<const char*>(&num_opt_tensors), sizeof(uint32_t));
+        for (const auto& t : state->exp_avg) {
+            save_tensor(t);
+        }
+        for (const auto& t : state->exp_avg_sq) {
+            save_tensor(t);
+        }
+    }
 }
 
-void StackedLinearRNNLM::load_checkpoint(const std::string& filepath) {
+bool StackedLinearRNNLM::load_checkpoint(const std::string& filepath, TrainingState* state) {
     std::ifstream ifs(filepath, std::ios::binary);
     if (!ifs.is_open()) {
         throw std::runtime_error("Não foi possível abrir checkpoint em: " + filepath);
+    }
+
+    char magic[4]{0, 0, 0, 0};
+    ifs.read(magic, 4);
+    bool has_header = (magic[0] == 'S' && magic[1] == 'O' && magic[2] == 'R' && magic[3] == 'E');
+
+    CheckpointHeader header;
+    if (has_header) {
+        ifs.seekg(0, std::ios::beg);
+        ifs.read(reinterpret_cast<char*>(&header), sizeof(CheckpointHeader));
+
+        // Validação estrita de compatibilidade de arquitetura contra o modelo instanciado
+        if (header.vocab_size != config_.vocab_size ||
+            header.d_model != config_.d_model ||
+            header.num_layers != config_.num_layers ||
+            header.d_mlp != config_.d_mlp ||
+            header.conv_kernel != config_.conv_kernel) {
+            std::ostringstream oss;
+            oss << "[Checkpoint Error] Incompatibilidade de arquitetura ao carregar checkpoint '"
+                << filepath << "':\n"
+                << "  Modelo atual: vocab=" << config_.vocab_size
+                << ", d_model=" << config_.d_model
+                << ", num_layers=" << config_.num_layers
+                << ", d_mlp=" << config_.d_mlp
+                << ", conv_kernel=" << config_.conv_kernel << "\n"
+                << "  Checkpoint:   vocab=" << header.vocab_size
+                << ", d_model=" << header.d_model
+                << ", num_layers=" << header.num_layers
+                << ", d_mlp=" << header.d_mlp
+                << ", conv_kernel=" << header.conv_kernel;
+            throw std::runtime_error(oss.str());
+        }
+
+        std::cout << "[Checkpoint] Formato soreRNN v" << header.version
+                  << " detectado (passo=" << header.step << ", tokens=" << header.total_trained_tokens
+                  << ", lr=" << header.current_lr << ", otimizador=" << (header.has_optimizer_state ? "Sim" : "Não") << ")." << std::endl;
+
+        if (state != nullptr) {
+            state->step = header.step;
+            state->total_trained_tokens = header.total_trained_tokens;
+            state->dataloader_cursor = header.dataloader_cursor;
+            state->current_lr = header.current_lr;
+            state->has_optimizer = (header.has_optimizer_state != 0);
+        }
+        ifs.seekg(header.header_size, std::ios::beg);
+    } else {
+        std::cout << "[Checkpoint] Formato legado detectado (sem header binário). Carregando pesos crus..." << std::endl;
+        ifs.seekg(0, std::ios::beg);
+        if (state != nullptr) {
+            state->step = 0;
+            state->total_trained_tokens = 0;
+            state->dataloader_cursor = 0;
+            state->current_lr = 0.0f;
+            state->has_optimizer = false;
+        }
     }
 
     auto load_tensor = [&](Tensor& t) {
@@ -435,6 +549,49 @@ void StackedLinearRNNLM::load_checkpoint(const std::string& filepath) {
         load_tensor(layers_[l].w_mlp2);
         load_tensor(layers_[l].b_mlp2);
     }
+
+    if (has_header && header.has_optimizer_state && state != nullptr) {
+        uint32_t num_opt_tensors = 0;
+        ifs.read(reinterpret_cast<char*>(&num_opt_tensors), sizeof(uint32_t));
+        auto params = parameters();
+        if (num_opt_tensors == params.size()) {
+            state->exp_avg.clear();
+            state->exp_avg_sq.clear();
+            for (size_t i = 0; i < num_opt_tensors; ++i) {
+                Tensor t(params[i]->shape(), DType::Float32, params[i]->device());
+                load_tensor(t);
+                state->exp_avg.push_back(std::move(t));
+            }
+            for (size_t i = 0; i < num_opt_tensors; ++i) {
+                Tensor t(params[i]->shape(), DType::Float32, params[i]->device());
+                load_tensor(t);
+                state->exp_avg_sq.push_back(std::move(t));
+            }
+            std::cout << " -> Momentos do AdamW (" << num_opt_tensors << " tensores m e v) restaurados com fidelidade total!" << std::endl;
+        }
+    }
+
+    return has_header;
+}
+
+float StackedLinearRNNLM::evaluate(data::DataLoader& val_loader, size_t max_batches) {
+    size_t batch_count = 0;
+    double sum_loss = 0.0;
+    size_t initial_cursor = val_loader.cursor();
+
+    val_loader.reset();
+    while (val_loader.has_next()) {
+        if (max_batches > 0 && batch_count >= max_batches) break;
+        auto batch = val_loader.next();
+        Tensor logits = forward(batch.inputs, val_loader.batch_size(), val_loader.seq_len());
+        Tensor dummy_d_logits = Tensor::zeros(logits.shape(), DType::Float32, Device::CUDA);
+        float loss = cuda::cross_entropy_loss_and_grad_cuda(logits, batch.targets, dummy_d_logits);
+        sum_loss += loss;
+        batch_count++;
+    }
+
+    val_loader.set_cursor(initial_cursor);
+    return batch_count > 0 ? static_cast<float>(sum_loss / static_cast<double>(batch_count)) : 0.0f;
 }
 
 } // namespace nn

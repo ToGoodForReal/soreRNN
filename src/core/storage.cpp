@@ -1,4 +1,5 @@
 #include "sore/core/storage.hpp"
+#include "sore/cuda/caching_allocator.hpp"
 #include <new>
 
 namespace sore {
@@ -42,8 +43,8 @@ void Storage::allocate() {
         }
         data_ = ptr;
     } else if (device_ == Device::CUDA) {
-        // Alocação na memória global da GPU (VRAM)
-        CUDA_CHECK(cudaMalloc(&data_, size_bytes_));
+        // Alocação de alta performance via pool de memória VRAM em cache
+        data_ = cuda::CUDACachingAllocator::instance().allocate(size_bytes_);
     }
 }
 
@@ -52,11 +53,8 @@ void Storage::deallocate() noexcept {
         if (device_ == Device::CPU) {
             std::free(data_);
         } else if (device_ == Device::CUDA) {
-            // Em destrutores (noexcept), nunca lançamos exceção
-            cudaError_t err = cudaFree(data_);
-            if (err != cudaSuccess) {
-                std::cerr << "[Warning] cudaFree failed: " << cudaGetErrorString(err) << std::endl;
-            }
+            // Devolução instantânea para o cache do pool (zero-overhead)
+            cuda::CUDACachingAllocator::instance().deallocate(data_);
         }
         data_ = nullptr;
         size_bytes_ = 0;
