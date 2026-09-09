@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     std::cout << "\n[3/3] >>> INICIANDO TREINAMENTO DO MODELO 300M <<<" << std::endl;
     if (!std::filesystem::exists(pretrain_path)) {
         std::cerr << "[Aviso] Dataset de pré-treino não encontrado em: " << pretrain_path << std::endl;
-        std::cerr << "Execute 'python3 scripts/prepare_interleaved_data.py' ou 'python3 scripts/prepare_data.py' primeiro." << std::endl;
+        std::cerr << "Execute 'python3 scripts/prepare_4b_pretrain.py --out data/pretrain_interleaved.bin --val_out data/val.bin' primeiro." << std::endl;
         return 1;
     }
 

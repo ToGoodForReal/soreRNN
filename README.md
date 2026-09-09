@@ -83,14 +83,23 @@ Ou execute cada binário de teste individualmente:
 ## Training examples
 
 ```bash
-# Modelo de 300 Milhões de Parâmetros (Otimizado para RTX 3050 com TF32 e Gradient Accumulation):
-./scripts/train_300m.sh
+# Runner unificado (pretrain -> SFT -> DPO -> aval):
+#   scripts/train.sh [MODE] [MODEL] [PASSOS]   MODE=pretrain|sft|dpo|all|test
+scripts/train.sh pretrain 150m 10000      # pre-treino de base (150M)
+scripts/train.sh pretrain 300m 15000      # pre-treino (300M, TF32 + grad accum)
+scripts/train.sh all 150m 10000           # pipeline completo: pretrain+SFT+DPO+test
 
-# Ou executável direto:
+# Gerar dados (dedup MinHash + EOS + val held-out, tokenizer PT):
+python3 scripts/prepare_4b_pretrain.py --out data/pretrain_75pt_25en.bin --val_out data/val.bin
+python3 scripts/prepare_500m_sft.py --out data/sft_chat_pt.bin --val_out data/sft_val.bin
+
+# Executaveis diretos (se preferir):
+./build/train_lm_150m 10000 4 1 1024
 ./build/train_lm_300m 15000 2 4 512
 
-# Modelo base de 150 Milhões de Parâmetros:
-./scripts/train.sh
+# Inference e avaliacao rapida:
+python3 scripts/chat.py --checkpoint checkpoints/sore_lm_150m_pretrain.bin
+python3 scripts/evaluate.py --checkpoint checkpoints/sore_lm_150m_sft.bin
 ```
 
 ## Project layout
