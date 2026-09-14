@@ -39,6 +39,9 @@ void refresh_bf16_weights(const std::vector<Tensor*>& params){
         if(!t || !t->is_defined() || t->device()!=Device::CUDA) continue;
         if(t->rank()!=2) continue;
         if(t->dtype()!=DType::Float32) continue;
+        // Evita espelhar matrizes gigantes de vocabulário (w_emb_ tem 50k x 1280 = 128MB em BF16).
+        // Isso economiza ~130MB fixos de VRAM e ~52MB no backward, usando cuBLAS TF32 nativo.
+        if(t->dim(0) > 10000 || t->dim(1) > 10000) continue;
         const float* wp = t->data<float>();
         size_t n = t->numel();
         Bf16Mirror& mir = m[wp];

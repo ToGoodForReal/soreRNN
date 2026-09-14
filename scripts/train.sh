@@ -49,8 +49,18 @@ case "$MODE" in sft|all|dpo|test)  build_targets+=(train_sft);; esac
 case "$MODE" in dpo|all)           build_targets+=(train_dpo);; esac
 [ ${#build_targets[@]} -eq 0 ] && build_targets=("train_lm_150m")
 echo -e "\n[Build] ${build_targets[*]}"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build build --target "${build_targets[@]}" -j"$(nproc)"
+if command -v cmake >/dev/null 2>&1; then
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
+  cmake --build build --target "${build_targets[@]}" -j"$(nproc)"
+else
+  echo " -> cmake não encontrado; utilizando binários já compilados em build/."
+  for t in "${build_targets[@]}"; do
+    if [ ! -x "build/$t" ]; then
+      echo "[Erro] Binário 'build/$t' não encontrado. Instale o cmake (sudo pacman -S cmake) para compilar."
+      exit 1
+    fi
+  done
+fi
 
 do_pretrain() {
   echo -e "\n[Fase 1/3: PRÉ-TREINO (puro)]"
@@ -62,13 +72,23 @@ do_pretrain() {
   # ATENÇÃO: train_lm_150m = [pretrain_steps][sft_steps][micro][accum][seq]
   #          train_lm_300m = [pretrain_steps][micro][accum][seq]
   # Mantemos SFT interno DESLIGADO (sft_steps=0) -> SFT roda depois, uma vez só.
-  # RESUME=1 -> retoma do checkpoint de pre-treino existente (salva a cada 250 passos)
-  RESUME_ARG=""
-  if [ "${RESUME:-0}" = "1" ] && [ -f "$PRE_CKPT" ]; then RESUME_ARG="$PRE_CKPT"; echo " -> Retomando de $PRE_CKPT"; fi
+  # RESUME=1 -> retoma do checkpoint mais recente (best.bin ou pretrain.bin, ou RESUME_CKPT)
+  RESUME_ARG="${RESUME_CKPT:-}"
+  if [ -z "$RESUME_ARG" ] && [ "${RESUME:-0}" = "1" ]; then
+    BEST_CKPT="checkpoints/sore_lm_${MODEL}_best.bin"
+    if [ -f "$BEST_CKPT" ] && { [ ! -f "$PRE_CKPT" ] || [ "$BEST_CKPT" -nt "$PRE_CKPT" ]; }; then
+      RESUME_ARG="$BEST_CKPT"
+    elif [ -f "$PRE_CKPT" ]; then
+      RESUME_ARG="$PRE_CKPT"
+    fi
+  fi
+  if [ -n "$RESUME_ARG" ] && [ -f "$RESUME_ARG" ]; then
+    echo " -> Retomando do checkpoint: $RESUME_ARG"
+  fi
   if [ "$MODEL" = "300m" ]; then
-    ./build/train_lm_300m "$STEPS" "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee "logs/pretrain_${MODEL}.log"
+    ./build/train_lm_300m "$STEPS" "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee -a "logs/pretrain_${MODEL}.log"
   else
-    ./build/train_lm_150m "$STEPS" 0 "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee "logs/pretrain_${MODEL}.log"
+    ./build/train_lm_150m "$STEPS" 0 "$MICRO" "$ACCUM" "$SEQ" $RESUME_ARG 2>&1 | tee -a "logs/pretrain_${MODEL}.log"
   fi
 }
 

@@ -168,17 +168,17 @@ Tensor StackedLinearRNNLM::forward(const std::vector<uint16_t>& tokens, size_t B
             cache_[l].x_norm1, layers_[l].w_conv, &layers_[l].b_conv, B, T, D
         );
 
-        // Gate Sigmoid e Projeção de Entrada
-        cache_[l].G = cuda::linear_cuda(cache_[l].x_conv, layers_[l].w_gate, &layers_[l].b_gate);
-        cache_[l].A = cuda::sigmoid_cuda(cache_[l].G);
+        // Gate Sigmoid e Projeção de Entrada (G é temporário, apenas A e U são mantidos)
+        Tensor G = cuda::linear_cuda(cache_[l].x_conv, layers_[l].w_gate, &layers_[l].b_gate);
+        cache_[l].A = cuda::sigmoid_cuda(G);
         cache_[l].U = cuda::linear_cuda(cache_[l].x_conv, layers_[l].w_in, &layers_[l].b_in);
 
         // Recorrência Linear Associativa (Lockstep / Parallel Scan)
         cache_[l].H = cuda::linear_rnn_forward_cuda(cache_[l].A, cache_[l].U);
-        cache_[l].Y_rnn = cuda::linear_cuda(cache_[l].H, layers_[l].w_out, &layers_[l].b_out);
+        Tensor Y_rnn = cuda::linear_cuda(cache_[l].H, layers_[l].w_out, &layers_[l].b_out);
 
-        // Conexão Residual 1: x = x + Y_rnn
-        cuda::add_residual_cuda(x, cache_[l].Y_rnn);
+        // Conexão Residual 1: x = x + Y_rnn (Y_rnn é liberado imediatamente)
+        cuda::add_residual_cuda(x, Y_rnn);
 
         // --- Sub-bloco 2: MLP (Channel-Mixing) com Ativação GELU ---
         cache_[l].x_in2 = x.clone();
@@ -186,10 +186,10 @@ Tensor StackedLinearRNNLM::forward(const std::vector<uint16_t>& tokens, size_t B
 
         cache_[l].mlp_in = cuda::linear_cuda(cache_[l].x_norm2, layers_[l].w_mlp1, &layers_[l].b_mlp1);
         cache_[l].mlp_act = cuda::gelu_cuda(cache_[l].mlp_in);
-        cache_[l].Y_mlp = cuda::linear_cuda(cache_[l].mlp_act, layers_[l].w_mlp2, &layers_[l].b_mlp2);
+        Tensor Y_mlp = cuda::linear_cuda(cache_[l].mlp_act, layers_[l].w_mlp2, &layers_[l].b_mlp2);
 
-        // Conexão Residual 2: x = x + Y_mlp
-        cuda::add_residual_cuda(x, cache_[l].Y_mlp);
+        // Conexão Residual 2: x = x + Y_mlp (Y_mlp é liberado imediatamente)
+        cuda::add_residual_cuda(x, Y_mlp);
     }
 
     // 3. RMSNorm Final
@@ -519,12 +519,14 @@ bool StackedLinearRNNLM::load_checkpoint(const std::string& filepath, TrainingSt
     }
 
     auto load_tensor = [&](Tensor& t) {
-        Tensor cpu_t(t.shape(), DType::Float32, Device::CPU);
-        ifs.read(reinterpret_cast<char*>(cpu_t.data<float>()), cpu_t.numel() * sizeof(float));
+        size_t n = t.numel();
+        size_t bytes = n * sizeof(float);
         if (t.device() == Device::CUDA) {
-            t = cpu_t.cuda();
+            std::vector<float> host_buf(n);
+            ifs.read(reinterpret_cast<char*>(host_buf.data()), bytes);
+            CUDA_CHECK(cudaMemcpy(t.raw_data(), host_buf.data(), bytes, cudaMemcpyHostToDevice));
         } else {
-            t = cpu_t;
+            ifs.read(reinterpret_cast<char*>(t.data<float>()), bytes);
         }
     };
 
