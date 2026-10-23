@@ -1,0 +1,42 @@
+"""Block: uma camada do tronco, com dois sub-blocos pré-norma (mixer e SwiGLU), cada um com seu residual."""
+from torch import Tensor, nn
+
+from sore.model.attention import GatedAttention
+from sore.model.config import ModelConfig
+from sore.model.gdn import GatedDeltaNet
+from sore.model.layers import RMSNorm, SwiGLU
+from sore.model.residual import make_residual
+
+
+class Block(nn.Module):
+    """`H = res.write(H, f(norm(res.read(H))))` para o mixer e depois para a FFN.
+
+    `mixer_type` é `"gdn"` (`GatedDeltaNet`) ou `"attn"` (`GatedAttention`). O stream `H` é
+    `[B,T,D]` (residual plain) ou `[B,T,n,D]` (hyper); `cu_seqlens` só vai para o mixer.
+    """
+
+    def __init__(self, cfg: ModelConfig, layer_idx: int, mixer_type: str) -> None:
+        super().__init__()
+        if mixer_type == "gdn":
+            mixer_cls = GatedDeltaNet
+        elif mixer_type == "attn":
+            mixer_cls = GatedAttention
+        else:
+            raise ValueError(f"mixer_type desconhecido: {mixer_type!r} (esperado 'gdn' ou 'attn')")
+        self.mixer_type = mixer_type
+        self.layer_idx = layer_idx
+
+        self.norm1 = RMSNorm(cfg.d_model, eps=cfg.norm_eps)
+        self.mixer = mixer_cls(cfg)
+        self.res_mixer = make_residual(cfg, layer_idx, sub=0)
+        self.norm2 = RMSNorm(cfg.d_model, eps=cfg.norm_eps)
+        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_dim)
+        self.res_ffn = make_residual(cfg, layer_idx, sub=1)
+
+    def forward(self, H: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
+        H = self.res_mixer.write(H, self.mixer(self.norm1(self.res_mixer.read(H)), cu_seqlens))
+        H = self.res_ffn.write(H, self.ffn(self.norm2(self.res_ffn.read(H))))
+        return H
+
+    def extra_repr(self) -> str:
+        return f"layer_idx={self.layer_idx}, mixer_type={self.mixer_type!r}"
