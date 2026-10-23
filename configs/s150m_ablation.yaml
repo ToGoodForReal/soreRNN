@@ -1,0 +1,17 @@
+# Ablação de arquitetura no preset s150m: 3B tokens.
+model_preset: s150m
+model_overrides: {grad_checkpoint: true}
+data_paths: ["data/pretrain/*.bin"]
+eos_id: 0  # definir após o plano do tokenizer
+
+# 2048 x 4 x 16 = 4096 x 2 x 16 = 131.072 tokens por passo -> 22.888 passos
+grad_accum: 16
+stages:
+  - {until_tokens: 2.1e9, seq_len: 2048, micro_batch: 4}
+  - {until_tokens: 3e9, seq_len: 4096, micro_batch: 2}
+total_tokens: 3e9
+
+warmup_steps: 500
+ckpt_every_tokens: 1e8
+compile: true
+out_dir: runs/s150m_ablation

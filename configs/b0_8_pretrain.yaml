@@ -1,0 +1,17 @@
+# Pré-treino do preset b0_8 (~0.8B) na RTX 4090: 50B tokens, contexto 4K até 35B e 8K depois.
+model_preset: b0_8
+model_overrides: {grad_checkpoint: true}
+data_paths: ["data/pretrain/*.bin"]
+eos_id: 0  # definir após o plano do tokenizer
+
+# 4096 x 2 x 64 = 8192 x 1 x 64 = 524.288 tokens por passo -> 95.367 passos
+grad_accum: 64
+stages:
+  - {until_tokens: 35e9, seq_len: 4096, micro_batch: 2}
+  - {until_tokens: 50e9, seq_len: 8192, micro_batch: 1}
+total_tokens: 50e9
+
+warmup_steps: 1000
+ckpt_every_tokens: 2.5e8
+compile: true
+out_dir: runs/b0_8_pretrain

@@ -1,0 +1,19 @@
+# Smoke local na RTX 3050: preset tiny com os kernels reais de GPU (FLA + flex).
+# Dados: uv run python scripts/make_synthetic_shard.py --out data/synth.bin --n-tokens 2000000 --vocab 512 --eos 0 --seed 0
+# Treino: uv run python -m sore.train --config configs/tiny_local.yaml [--max-steps N] [--resume runs/tiny_local/last.pt]
+model_preset: tiny
+model_overrides: {gdn_backend: fla, attn_backend: flex}
+data_paths: ["data/synth.bin"]
+eos_id: 0
+
+# 512 tokens por passo nos dois estágios (128 x 4 = 256 x 2) -> 781 passos
+grad_accum: 1
+stages:
+  - {until_tokens: 200000, seq_len: 128, micro_batch: 4}
+  - {until_tokens: 400000, seq_len: 256, micro_batch: 2}
+total_tokens: 400000
+
+warmup_steps: 20
+ckpt_every_tokens: 200000
+out_dir: runs/tiny_local
+device: auto
