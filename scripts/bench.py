@@ -87,7 +87,7 @@ def main() -> None:
     torch.manual_seed(0)
     cfg = get_preset(args.preset, grad_checkpoint=args.grad_checkpoint)
     model = SoreLM(cfg).to(device)
-    optimizers = build_optimizers(model, lr_muon=0.02, lr_adamw=3e-3, weight_decay=0.1)
+    optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
     if args.compile:
         compile_model(model)  # in-place, por Block
     flops = flops_per_token(cfg, args.seq_len)

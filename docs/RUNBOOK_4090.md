@@ -8,7 +8,7 @@ Operação do pré-treino de ~6–7 semanas do preset `b0_8` numa RTX 4090 24GB 
 | Modelo | `b0_8`: 781,2M parâmetros (697,4M sem embedding), vocab 65.536, MTP 1 camada |
 | Tokens | 50B, 95.367 passos de 524.288 tokens (`grad_accum` 64) |
 | Estágios | 4096 × micro_batch 2 até 35B tokens (~passo 66.758), depois 8192 × 1 |
-| LR | WSD: warmup de 1.000 passos, platô, decay nos últimos 20% (a partir do passo ~76.294) |
+| LR | 3e-3 no Muon e no AdamW. WSD: warmup de 1.000 passos, platô, decay nos últimos 20% (a partir do passo ~76.294) |
 | FLOPs de treino por token | 5,48 GFLOP a 4K e 5,70 GFLOP a 8K (`sore/model/flops.py`) |
 | Checkpoint | `runs/b0_8_pretrain/last.pt` a cada 2,5e8 tokens (~477 passos), ~6–7 GB cada |
 
@@ -27,6 +27,10 @@ Antes de lançar, edite `configs/b0_8_pretrain.yaml`:
 - `data_paths` e `eos_id` reais (hoje são placeholders, ver seção 6). Os shards são `uint32` com o
   sidecar `.json` ao lado.
 - `peak_tflops` fica no padrão 165 (pico BF16 denso da 4090) e só serve para o `mfu` do log.
+- `lr_muon` e `lr_adamw` (3e-3, padrão do `TrainConfig`) ainda não foram validados. Com o
+  `match_rms_adamw` o lr do Muon tem a escala do AdamW, e o 0,02 da literatura vale para outra
+  escala. A ablação no s150m (`configs/s150m_ablation.yaml`) deve varrer o lr antes do lançamento,
+  por exemplo 1e-3 / 3e-3 / 6e-3.
 
 ## 2. Portão obrigatório (antes de lançar)
 
@@ -118,7 +122,7 @@ Cada passo grava uma linha JSON em `runs/b0_8_pretrain/metrics.jsonl`:
 | `loss`, `lm_loss`, `mtp_loss` | `lm + 0,3·mtp`, médias ponderadas por token | caem. O `mtp_loss` fica acima do `lm_loss` (prevê t+2). Spike sustentado: investigar |
 | `grad_norm` | norma antes do clip (1,0) | estável depois do warmup. Subida contínua ou picos frequentes ≫ 1 indicam instabilidade |
 | `skipped` | passo pulado por grad norm não finito (`loss`/`grad_norm` viram `null`) | raro. Vários seguidos: parar e investigar |
-| `lr_muon` | lr efetivo do Muon (`initial_lr × wsd`) | sobe por 1.000 passos, platô em 0,02, decai a partir do passo ~76.294 |
+| `lr_muon` | lr do Muon (`initial_lr × wsd`), antes da escala `0,2·√max(A, B)` do `match_rms_adamw` | sobe por 1.000 passos, platô em 3e-3, decai a partir do passo ~76.294 |
 | `tok_s`, `mfu` | throughput do passo e MFU (`flops_per_token × tok_s / pico`) | estáveis. Queda indica throttling térmico ou outro processo na GPU (`nvidia-smi`) |
 | `mem_gb` | `max_memory_allocated` desde o início do processo (só sobe) | ≤ 22. Sobe na troca para 8K |
 | `seq_len` | contexto do estágio | 4096 até 35B tokens, depois 8192 |

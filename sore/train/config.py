@@ -69,8 +69,8 @@ class TrainConfig:
     stages: list[Stage]
     total_tokens: int
 
-    # Otimização
-    lr_muon: float = 0.02
+    # Otimização (com match_rms_adamw o lr do Muon tem a escala do AdamW: os dois começam iguais)
+    lr_muon: float = 3e-3
     lr_adamw: float = 3e-3
     warmup_steps: int = 500
     decay_frac: float = 0.2

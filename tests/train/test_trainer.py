@@ -329,11 +329,12 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
     assert all(type(s.until_tokens) is int for s in cfg.stages)
     assert cfg.ckpt_every_tokens == 250_000_000 and type(cfg.ckpt_every_tokens) is int
     assert cfg.lr_adamw == 3e-3 and type(cfg.lr_adamw) is float
-    # defaults do brief
+    # defaults do brief; lr_muon = lr_adamw porque o Muon usa match_rms_adamw (R21)
     assert cfg.model_overrides == {}
     assert (cfg.lr_muon, cfg.warmup_steps, cfg.decay_frac, cfg.weight_decay, cfg.grad_clip) == (
-        0.02, 500, 0.2, 0.1, 1.0
+        3e-3, 500, 0.2, 0.1, 1.0
     )
+    assert TrainConfig.lr_muon == TrainConfig.lr_adamw
     assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 165.0)
 
 

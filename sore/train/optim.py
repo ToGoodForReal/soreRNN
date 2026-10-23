@@ -50,8 +50,9 @@ def build_optimizers(
     optimizers: list[torch.optim.Optimizer] = []
 
     if muon_params:
-        # match_rms_adamw aplica a escala de Moonlight (0.2 * sqrt(max(A, B))): o update do
-        # Muon fica com o mesmo RMS do AdamW e os dois podem compartilhar a ordem de grandeza do LR.
+        # match_rms_adamw multiplica o lr por 0.2 * sqrt(max(A, B)) (Moonlight): o update do Muon
+        # fica com o RMS de um update do AdamW, então `lr_muon` é um lr na escala do AdamW
+        # (default 3e-3, igual ao `lr_adamw`). O 0.02 da literatura vale para adjust_lr_fn="original".
         optimizers.append(
             torch.optim.Muon(
                 [{"params": muon_params, "initial_lr": lr_muon}],
