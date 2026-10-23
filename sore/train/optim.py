@@ -38,6 +38,28 @@ def split_param_groups(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Pa
     return muon, adamw
 
 
+def apply_config_hparams(
+    optimizers: list[torch.optim.Optimizer], lr_muon: float, lr_adamw: float, weight_decay: float
+) -> list[str]:
+    """Reescreve `initial_lr` e `weight_decay` de cada param group (ruling R26); devolve o que mudou.
+
+    Usado depois de `load_state_dict`, que traz esses valores do checkpoint: na retomada vale o
+    config. Muon: `lr_muon` e `weight_decay`. AdamW: `lr_adamw`, com `weight_decay` no grupo de
+    decay (parâmetros com `ndim >= 2`, a regra de `build_optimizers`) e 0 no outro.
+    """
+    changes = []
+    for opt in optimizers:
+        muon = isinstance(opt, torch.optim.Muon)
+        for i, group in enumerate(opt.param_groups):
+            decays = muon or group["params"][0].ndim >= 2
+            target = {"initial_lr": lr_muon if muon else lr_adamw, "weight_decay": weight_decay if decays else 0.0}
+            for key, new in target.items():
+                if group[key] != new:
+                    changes.append(f"{type(opt).__name__} grupo {i}: {key} {group[key]:g} -> {new:g}")
+                    group[key] = new
+    return changes
+
+
 def build_optimizers(
     model: nn.Module, lr_muon: float, lr_adamw: float, weight_decay: float
 ) -> list[torch.optim.Optimizer]:

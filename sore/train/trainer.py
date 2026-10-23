@@ -34,7 +34,7 @@ from sore.model.loss import IGNORE_INDEX
 from sore.train.checkpoint import load_checkpoint, save_checkpoint
 from sore.train.config import Stage, TrainConfig, resolve_data_paths
 from sore.train.data import PackedTokenStream
-from sore.train.optim import build_optimizers
+from sore.train.optim import apply_config_hparams, build_optimizers
 from sore.train.schedule import linear_schedule, wsd_multiplier
 
 
@@ -251,6 +251,8 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     spikes = LossSpikeDetector(cfg.spike_threshold)
     if resume is not None:
         data_state, train_state = load_checkpoint(resume, model, optimizers)
+        for change in apply_config_hparams(optimizers, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay):
+            print(f"[resume] aviso: {change} (vale o config)", flush=True)
         stream.load_state_dict(data_state)
         step, skipped, last_loss = train_state["step"], train_state["skipped_steps"], train_state["last_loss"]
         spikes.ema = train_state["loss_ema"]

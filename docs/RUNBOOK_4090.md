@@ -183,8 +183,10 @@ treino quem manda é o λ do `TrainConfig`.
   `FLEX_MIN_LEN` = 128, o que não afeta o treino (N ≥ 4096). O BlockMask do flex é montado uma vez
   por forward no `SoreLM` e compartilhado pelas camadas de atenção e pelo MTP (a T=8192, cada
   montagem custa ~21 ms e ~670 MB transitórios).
-- **Mudar o lr no YAML não vale na retomada.** O `initial_lr` (e os demais hiperparâmetros dos
-  param groups, como `weight_decay`) volta do checkpoint.
+- **Na retomada, `lr_muon`, `lr_adamw` e `weight_decay` vêm do YAML.** O trainer reescreve o
+  `initial_lr` e o `weight_decay` de cada param group a partir do config e imprime
+  `[resume] aviso: ...` para cada valor que mudou em relação ao checkpoint. Os demais
+  hiperparâmetros dos param groups (betas, eps, momentum do Muon) voltam do checkpoint.
 - **`metrics.jsonl` pode repetir passos depois de crash + retomada.** Os passos após o último
   checkpoint são refeitos e gravados de novo. Para cada `step`, vale o último registro.
 - **Crash sem sinal perde até `ckpt_every_tokens` de trabalho.** Queda de energia, OOM ou

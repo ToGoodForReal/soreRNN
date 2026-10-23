@@ -17,6 +17,7 @@ from sore.model import get_preset
 from sore.model.flops import flops_per_token
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
 from sore.train.data import write_token_shard
+from sore.train.schedule import wsd_multiplier
 from sore.train.trainer import LossSpikeDetector, TrainSummary, compile_model, train
 
 REPO = Path(__file__).resolve().parents[2]
@@ -273,6 +274,37 @@ def test_loss_spike_flag(tmp_path, monkeypatch, capsys):
 
     assert [m["spike"] for m in _metrics(cfg.out_dir)] == [False] * 7 + [True] + [False] * 4
     assert "[spike] passo 8" in capsys.readouterr().out
+
+
+def test_resume_applies_config_lr_and_weight_decay(tmp_path, capsys):
+    # R26: na retomada, initial_lr e weight_decay de cada param group vêm do TrainConfig atual
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, warmup_steps=0)
+    train(cfg, max_steps=1)
+    changed = dataclasses.replace(cfg, lr_muon=1e-3, lr_adamw=2e-2, weight_decay=0.05)
+
+    seen = []
+    from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+    handle = register_optimizer_step_pre_hook(
+        lambda opt, args, kwargs: seen.append(
+            (type(opt).__name__, [(g["initial_lr"], g["lr"], g["weight_decay"]) for g in opt.param_groups])
+        )
+    )
+    capsys.readouterr()
+    try:
+        train(changed, resume=Path(cfg.out_dir) / "last.pt", max_steps=1)
+    finally:
+        handle.remove()
+
+    mult = wsd_multiplier(1, 0, 10, 0.2)  # o passo retomado é o de índice 1
+    assert seen == [
+        ("Muon", [(1e-3, 1e-3 * mult, 0.05)]),
+        ("AdamW", [(2e-2, 2e-2 * mult, 0.05), (2e-2, 2e-2 * mult, 0.0)]),  # decay e no-decay
+    ]
+    assert _metrics(cfg.out_dir)[-1]["lr_muon"] == pytest.approx(1e-3 * mult)
+    warnings = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[resume] aviso")]
+    assert len(warnings) == 5, warnings  # Muon lr e wd, AdamW lr nos 2 grupos e wd do grupo com decay
 
 
 def test_mtp_weight_can_change_on_resume(tmp_path):
