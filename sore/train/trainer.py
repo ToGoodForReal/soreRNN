@@ -52,8 +52,8 @@ def active_stage(stages: list[Stage], tokens: int) -> Stage:
 def _sync_stage(stream: PackedTokenStream, stages: list[Stage]) -> bool:
     """Ajusta o formato do stream ao estágio ativo; True se mudou.
 
-    `set_shape` volta a posição a 0, então só é chamado quando o formato muda de fato: depois de um
-    `load_state_dict` no meio de um estágio, o stream continua de onde parou.
+    `set_shape` avança a posição até a próxima unidade inteira, então só é chamado quando o formato
+    muda de fato: depois de um `load_state_dict` no meio de um estágio, o stream continua de onde parou.
     """
     stage = active_stage(stages, stream.tokens_consumed)
     if (stream.seq_len, stream.micro_batch) == (stage.seq_len, stage.micro_batch):
@@ -151,7 +151,8 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
         compile_model(model)  # in-place, por Block: os nomes dos parâmetros não mudam
     first = cfg.stages[0]
     stream = PackedTokenStream(
-        resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed
+        resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed,
+        unit_len=max(s.seq_len for s in cfg.stages),  # R22: a troca de estágio não reamostra o corpus
     )
 
     step, skipped, last_loss = 0, 0, math.nan

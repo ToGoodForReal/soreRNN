@@ -125,6 +125,9 @@ def test_resume_equivalence(tmp_path, straight_run, split):
     final, final_straight = _ckpt_model_state(cfg.out_dir), _ckpt_model_state(straight_cfg.out_dir)
     for name, value in final_straight.items():
         torch.testing.assert_close(final[name], value, rtol=0, atol=1e-5, msg=name)
+    # R22: unidades do tamanho do maior seq_len, então a troca 32 -> 64 não reamostra o corpus
+    data_state = torch.load(Path(cfg.out_dir) / "last.pt", weights_only=True)["data_state"]
+    assert data_state["unit_len"] == 64
 
 
 def test_nonfinite_step_skipped(tmp_path, monkeypatch):
@@ -356,6 +359,11 @@ def test_load_train_config_peak_tflops(tmp_path):
             "  - {until_tokens: 50e9, seq_len: 8192, micro_batch: 1}",
             "50e9", "", "crescente",
         ),
+        (
+            "  - {until_tokens: 35e9, seq_len: 3072, micro_batch: 4}\n"
+            "  - {until_tokens: 50e9, seq_len: 4096, micro_batch: 3}",
+            "50e9", "", "dividir",
+        ),
         (GOOD_STAGES, "60e9", "", "total_tokens"),
         ("  []", "50e9", "", "estágio"),
         (GOOD_STAGES, "50e9", "seq_length: 4096\n", "desconhecid"),
@@ -363,7 +371,8 @@ def test_load_train_config_peak_tflops(tmp_path):
         (GOOD_STAGES, "50e9", "peak_tflops: 0\n", "peak_tflops"),
     ],
     ids=[
-        "tokens_per_microbatch", "not_ascending", "last_below_total", "empty", "unknown_key", "fractional",
+        "tokens_per_microbatch", "not_ascending", "seq_len_not_divisor", "last_below_total", "empty",
+        "unknown_key", "fractional",
         "peak_tflops_zero",
     ],
 )

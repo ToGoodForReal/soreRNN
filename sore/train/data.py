@@ -3,9 +3,10 @@
 Formato em disco: `uint32` little-endian cru (`<u4`) mais um sidecar JSON
 `{"n_tokens": int, "dtype": "uint32"}` ao lado (`path.with_suffix(".json")`).
 
-O stream sorteia janelas de `seq_len + 1` tokens (entrada = `[:-1]`, alvo = `[1:]`) por uma
-permutação determinística de `(seed, epoch, seq_len)` e empacota `micro_batch` janelas numa
-única linha `[1, N]`, com `cu_seqlens` marcando fronteiras de documento (EOS) e de linha.
+O stream sorteia unidades fixas de `unit_len` tokens por uma permutação determinística de
+`(seed, epoch, unit_len)`, corta cada unidade em janelas consecutivas de `seq_len + 1` tokens
+(entrada = `[:-1]`, alvo = `[1:]`) e empacota `micro_batch` janelas numa única linha `[1, N]`, com
+`cu_seqlens` marcando fronteiras de documento (EOS) e de linha.
 """
 from __future__ import annotations
 
@@ -53,19 +54,41 @@ def _open_shard(path: Path) -> np.ndarray:
 class PackedTokenStream:
     """Stream infinito de `Batch` sobre shards, determinístico e retomável via `state_dict()`.
 
-    Regras (ruling R14): janelas nunca cruzam shards. Um shard de tamanho L tem
-    `(L - 1) // seq_len` janelas não sobrepostas; a janela w cobre os tokens
-    `[w * seq_len, w * seq_len + seq_len + 1)` (janelas vizinhas dividem um token: o alvo da
-    última entrada). A cada época as janelas globais são visitadas na ordem de
-    `default_rng([seed, epoch, seq_len]).permutation(num_windows)`; quando restam menos que
-    `micro_batch` janelas, a sobra é descartada e começa a época seguinte.
+    Regras (rulings R14 e R22): o corpus é dividido em unidades fixas de `unit_len` tokens
+    (padrão: `seq_len`), que nunca cruzam shards. Um shard de tamanho L tem `(L - 1) // unit_len`
+    unidades; a unidade u cobre os tokens `[u * U, u * U + U + 1)`, e um shard com menos de
+    `unit_len + 1` tokens não contribui com nenhuma. Com `seq_len = s` (exige `U % s == 0`) cada
+    unidade rende `U // s` janelas consecutivas, `[u * U + k * s, u * U + (k + 1) * s + 1)` (janelas
+    vizinhas dividem um token: o alvo da última entrada).
+
+    A cada época as unidades são visitadas na ordem de
+    `default_rng([seed, epoch, unit_len]).permutation(num_units)`, que não depende do `seq_len`.
+    `position` conta janelas do formato atual dentro da época. Quando restam menos que
+    `micro_batch` janelas, a sobra é descartada e começa a época seguinte. Uma troca de formato
+    (`set_shape`) continua a mesma época a partir da 1a unidade ainda não tocada, então nenhuma
+    janela se repete dentro da época (ruling R22).
     """
 
-    def __init__(self, paths: list[Path], seq_len: int, micro_batch: int, eos_id: int, seed: int):
+    def __init__(
+        self,
+        paths: list[Path],
+        seq_len: int,
+        micro_batch: int,
+        eos_id: int,
+        seed: int,
+        unit_len: int | None = None,
+    ):
         if not paths:
             raise ValueError("é preciso ao menos um shard")
         self._shards = [_open_shard(Path(p)) for p in paths]
         self._n_tokens = sum(len(s) for s in self._shards)
+        self.unit_len = seq_len if unit_len is None else unit_len
+        if self.unit_len < 1:
+            raise ValueError(f"unit_len deve ser >= 1, recebeu {self.unit_len}")
+        counts = np.array([max(0, (len(s) - 1) // self.unit_len) for s in self._shards], dtype=np.int64)
+        self._cum = np.cumsum(counts)  # unidades acumuladas até o fim de cada shard
+        self._first = self._cum - counts  # índice global da 1a unidade de cada shard
+        self.num_units = int(self._cum[-1])
         self.eos_id = eos_id
         self.seed = seed
         self.epoch = 0
@@ -74,31 +97,32 @@ class PackedTokenStream:
         self._apply_shape(seq_len, micro_batch)
         self._perm = self._permutation()
 
-    # --- janelas e permutação -------------------------------------------------------------
+    # --- unidades, janelas e permutação ---------------------------------------------------
 
-    def _window_counts(self, seq_len: int, micro_batch: int) -> np.ndarray:
-        """Janelas por shard para o formato dado; valida o formato (ValueError)."""
+    def _windows_per_unit(self, seq_len: int, micro_batch: int) -> int:
+        """Janelas por unidade para o formato dado; valida o formato (ValueError)."""
         if seq_len < 1 or micro_batch < 1:
             raise ValueError(f"seq_len e micro_batch devem ser >= 1, recebeu {seq_len}, {micro_batch}")
-        counts = np.array([max(0, (len(s) - 1) // seq_len) for s in self._shards], dtype=np.int64)
-        if counts.sum() < micro_batch:
+        if self.unit_len % seq_len != 0:
+            raise ValueError(f"unit_len={self.unit_len} não é múltiplo de seq_len={seq_len}")
+        per_unit = self.unit_len // seq_len
+        if self.num_units * per_unit < micro_batch:
             raise ValueError(
-                f"{int(counts.sum())} janelas de seq_len={seq_len} nos shards, "
-                f"insuficiente para micro_batch={micro_batch}"
+                f"{self.num_units * per_unit} janelas de seq_len={seq_len} nos shards "
+                f"({self.num_units} unidades de {self.unit_len}), insuficiente para micro_batch={micro_batch}"
             )
-        return counts
+        return per_unit
 
     def _apply_shape(self, seq_len: int, micro_batch: int) -> None:
-        counts = self._window_counts(seq_len, micro_batch)  # valida antes de mexer no estado
+        per_unit = self._windows_per_unit(seq_len, micro_batch)  # valida antes de mexer no estado
         self.seq_len = seq_len
         self.micro_batch = micro_batch
-        self._cum = np.cumsum(counts)  # janelas acumuladas até o fim de cada shard
-        self._first = self._cum - counts  # índice global da 1a janela de cada shard
-        self.num_windows = int(self._cum[-1])
+        self._per_unit = per_unit
+        self.num_windows = self.num_units * per_unit
 
     def _permutation(self) -> np.ndarray:
-        rng = np.random.default_rng([self.seed, self.epoch, self.seq_len])
-        return rng.permutation(self.num_windows)
+        rng = np.random.default_rng([self.seed, self.epoch, self.unit_len])
+        return rng.permutation(self.num_units)
 
     # --- iteração ---------------------------------------------------------------------------
 
@@ -110,11 +134,12 @@ class PackedTokenStream:
             self.epoch += 1
             self.position = 0
             self._perm = self._permutation()
-        windows = self._perm[self.position : self.position + self.micro_batch]
+        windows = np.arange(self.position, self.position + self.micro_batch)
         self.position += self.micro_batch
 
-        shard_ids = np.searchsorted(self._cum, windows, side="right")
-        starts = (windows - self._first[shard_ids]) * self.seq_len
+        units = self._perm[windows // self._per_unit]
+        shard_ids = np.searchsorted(self._cum, units, side="right")
+        starts = (units - self._first[shard_ids]) * self.unit_len + (windows % self._per_unit) * self.seq_len
         rows = np.empty((self.micro_batch, self.seq_len + 1), dtype=np.int64)  # int64 só aqui
         for r, (shard, start) in enumerate(zip(shard_ids, starts)):
             rows[r] = self._shards[shard][start : start + self.seq_len + 1]
@@ -137,14 +162,17 @@ class PackedTokenStream:
         )
 
     def set_shape(self, seq_len: int, micro_batch: int) -> None:
-        """Novo formato (estágio de currículo): nova grade de janelas e nova permutação.
+        """Novo formato (estágio de currículo) na mesma época e na mesma permutação de unidades.
 
-        `epoch` e `tokens_consumed` são mantidos; `position` volta a 0. ValueError (sem alterar
-        o stream) se o formato for inválido ou os shards não tiverem `micro_batch` janelas.
+        `position` passa para a 1a unidade que ainda não foi tocada, nem em parte (o resto de uma
+        unidade começada é pulado), e `epoch` e `tokens_consumed` são mantidos. ValueError (sem
+        alterar o stream) se o formato for inválido, se `unit_len % seq_len != 0` ou se não houver
+        `micro_batch` janelas.
         """
+        old_per_unit = self._per_unit
         self._apply_shape(seq_len, micro_batch)
-        self.position = 0
-        self._perm = self._permutation()
+        units_started = -(-self.position // old_per_unit)  # ceil
+        self.position = units_started * self._per_unit
 
     # --- checkpoint -----------------------------------------------------------------------
 
@@ -156,6 +184,7 @@ class PackedTokenStream:
             "position": self.position,
             "seq_len": self.seq_len,
             "micro_batch": self.micro_batch,
+            "unit_len": self.unit_len,
             "tokens_consumed": self.tokens_consumed,
             "eos_id": self.eos_id,
             "n_shards": len(self._shards),
@@ -163,7 +192,11 @@ class PackedTokenStream:
         }
 
     def load_state_dict(self, d: dict) -> None:
-        """Restaura o estado (inclusive o formato) e regenera a permutação da época."""
+        """Restaura o estado (inclusive o formato) e regenera a permutação da época.
+
+        ValueError se os shards, o `eos_id` ou o `unit_len` diferirem: o `unit_len` define a
+        grade de unidades e a permutação, então a posição salva só vale com o mesmo valor.
+        """
         if d["n_shards"] != len(self._shards) or d["n_tokens"] != self._n_tokens:
             raise ValueError(
                 f"conjunto de shards diferente do checkpoint: estado tem {d['n_shards']} shards / "
@@ -171,6 +204,11 @@ class PackedTokenStream:
             )
         if d["eos_id"] != self.eos_id:
             raise ValueError(f"eos_id do checkpoint ({d['eos_id']}) difere do stream ({self.eos_id})")
+        if d["unit_len"] != self.unit_len:
+            raise ValueError(
+                f"unit_len do checkpoint ({d['unit_len']}) difere do stream ({self.unit_len}); "
+                "no trainer ele é o maior seq_len dos estágios"
+            )
         self._apply_shape(d["seq_len"], d["micro_batch"])
         self.seed = d["seed"]
         self.epoch = d["epoch"]

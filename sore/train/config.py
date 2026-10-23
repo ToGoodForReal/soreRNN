@@ -105,6 +105,12 @@ class TrainConfig:
         if len(per_micro) != 1:
             # tokens por passo constantes => o schedule por passo (WSD) é exato entre estágios
             raise ValueError(f"seq_len * micro_batch deve ser igual em todos os estágios, recebeu {sorted(per_micro)}")
+        longest = max(s.seq_len for s in self.stages)
+        if any(longest % s.seq_len for s in self.stages):
+            # o stream corta o corpus em unidades do maior seq_len (R22)
+            raise ValueError(
+                f"todo seq_len deve dividir o maior ({longest}), recebeu {[s.seq_len for s in self.stages]}"
+            )
         until = [s.until_tokens for s in self.stages]
         if any(b <= a for a, b in zip(until, until[1:])):
             raise ValueError(f"until_tokens dos estágios deve ser estritamente crescente, recebeu {until}")

@@ -178,23 +178,115 @@ def test_seed_controls_order(tmp_path):
 
 def test_set_shape_changes_shape(tmp_path):
     path = _periodic_shard(tmp_path, 4000)
-    stream = PackedTokenStream([path], seq_len=16, micro_batch=2, eos_id=0, seed=0)
+    stream = PackedTokenStream([path], seq_len=16, micro_batch=2, eos_id=0, seed=0, unit_len=32)
     first = next(stream)
     assert first.input_ids.shape == (1, 32)
     assert stream.tokens_consumed == 32
 
     stream.set_shape(seq_len=32, micro_batch=4)
     state = stream.state_dict()
-    assert (state["seq_len"], state["micro_batch"], state["position"]) == (32, 4, 0)
+    # as 2 janelas de 16 consumiram a 1a unidade de 32: o novo formato começa na 2a
+    assert (state["seq_len"], state["micro_batch"], state["position"], state["unit_len"]) == (32, 4, 1, 32)
     second = next(stream)
     assert second.input_ids.shape == second.labels.shape == (1, 128)
     assert second.cu_seqlens[-1].item() == 128
     assert stream.tokens_consumed == 32 + 128
 
     # o estado do novo formato também é retomável
-    resumed = PackedTokenStream([path], seq_len=16, micro_batch=2, eos_id=0, seed=0)
+    resumed = PackedTokenStream([path], seq_len=16, micro_batch=2, eos_id=0, seed=0, unit_len=32)
     resumed.load_state_dict(stream.state_dict())
     assert torch.equal(next(resumed).input_ids, next(stream).input_ids)
+
+
+# R22: 97 tokens com valores 1..97 (sem EOS) -> 6 unidades de 16; o 1º token de cada linha
+# identifica a janela (offset no shard = valor - 1)
+UNIT, N_UNITS = 16, 6
+
+
+def _unit_stream(tmp_path, seq_len, micro_batch, seed=0):
+    path = tmp_path / "units.bin"
+    if not path.exists():
+        write_token_shard(path, np.arange(1, N_UNITS * UNIT + 2))
+    return PackedTokenStream([path], seq_len, micro_batch, eos_id=0, seed=seed, unit_len=UNIT)
+
+
+def _window_starts(batch, seq_len):
+    return (batch.input_ids[0, ::seq_len] - 1).tolist()
+
+
+def test_windows_are_consecutive_within_a_unit(tmp_path):
+    stream = _unit_stream(tmp_path, seq_len=4, micro_batch=2)
+    assert (stream.num_units, stream.num_windows) == (N_UNITS, N_UNITS * 4)
+    starts = [s for _ in range(12) for s in _window_starts(next(stream), 4)]  # uma época inteira
+    assert stream.epoch == 0
+    # as 4 janelas de cada unidade saem em sequência e cobrem a unidade inteira, uma vez
+    units = [starts[i : i + 4] for i in range(0, 24, 4)]
+    assert all(u == [u[0], u[0] + 4, u[0] + 8, u[0] + 12] and u[0] % UNIT == 0 for u in units)
+    assert sorted(u[0] for u in units) == [UNIT * k for k in range(N_UNITS)]
+    # a ordem das unidades não depende do seq_len: é a mesma de um stream com seq_len = unit_len
+    whole = _unit_stream(tmp_path, seq_len=UNIT, micro_batch=1)
+    assert [u[0] for u in units] == [_window_starts(next(whole), UNIT)[0] for _ in range(N_UNITS)]
+
+
+def test_stage_switch_continues_the_epoch_without_repeats(tmp_path):
+    stream = _unit_stream(tmp_path, seq_len=4, micro_batch=3)
+    before = _window_starts(next(stream), 4)  # 3 das 4 janelas da 1a unidade
+    u0 = before[0]
+    assert before == [u0, u0 + 4, u0 + 8]
+
+    stream.set_shape(seq_len=UNIT, micro_batch=1)
+    assert (stream.epoch, stream.position) == (0, 1)  # pula o resto da unidade começada
+    after = [_window_starts(next(stream), UNIT)[0] for _ in range(N_UNITS - 1)]
+    assert stream.epoch == 0  # a mesma época continua, sem recomeçar a permutação
+    # nenhuma janela repetida: as 5 unidades restantes, cada uma uma vez, nenhuma é a começada
+    assert u0 not in after and sorted(after + [u0]) == [UNIT * k for k in range(N_UNITS)]
+    # é a continuação da permutação da época: a ordem de um stream que começou com seq_len = unit_len
+    whole = _unit_stream(tmp_path, seq_len=UNIT, micro_batch=1)
+    assert [u0, *after] == [_window_starts(next(whole), UNIT)[0] for _ in range(N_UNITS)]
+    next(stream)
+    assert stream.epoch == 1  # só depois de esgotar as unidades
+
+
+def test_resume_after_set_shape(tmp_path):
+    stream = _unit_stream(tmp_path, seq_len=4, micro_batch=3)
+    next(stream)
+    stream.set_shape(seq_len=8, micro_batch=2)
+    next(stream)
+    state = stream.state_dict()
+    expected = [next(stream) for _ in range(8)]  # atravessa a virada de época
+
+    resumed = _unit_stream(tmp_path, seq_len=4, micro_batch=3)
+    resumed.load_state_dict(state)
+    for want in expected:
+        got = next(resumed)
+        assert torch.equal(got.input_ids, want.input_ids)
+        assert torch.equal(got.cu_seqlens, want.cu_seqlens)
+    assert resumed.state_dict() == stream.state_dict()
+
+
+def test_unit_len_validation(tmp_path):
+    with pytest.raises(ValueError, match="unit_len"):
+        _unit_stream(tmp_path, seq_len=6, micro_batch=1)  # 16 % 6 != 0
+    stream = _unit_stream(tmp_path, seq_len=4, micro_batch=1)
+    with pytest.raises(ValueError, match="unit_len"):
+        stream.set_shape(seq_len=32, micro_batch=1)
+    assert next(stream).input_ids.shape == (1, 4)  # a falha não altera o stream
+    state = stream.state_dict()
+    other = PackedTokenStream(
+        [tmp_path / "units.bin"], seq_len=4, micro_batch=1, eos_id=0, seed=0, unit_len=2 * UNIT
+    )
+    with pytest.raises(ValueError, match="unit_len"):
+        other.load_state_dict(state)
+
+
+def test_short_shard_contributes_no_units(tmp_path):
+    # unit_len=16: um shard de 16 tokens (< unit_len + 1) não tem unidade; um de 40 tem 2
+    short = _shard(tmp_path, np.arange(1, 17), "short.bin")
+    long = _shard(tmp_path, np.arange(1000, 1040), "long.bin")
+    stream = PackedTokenStream([short, long], seq_len=8, micro_batch=1, eos_id=0, seed=0, unit_len=16)
+    assert (stream.num_units, stream.num_windows) == (2, 4)
+    starts = sorted(next(stream).input_ids[0, 0].item() for _ in range(4))
+    assert starts == [1000, 1008, 1016, 1024]
 
 
 def test_windows_never_cross_shard_boundaries(tmp_path):
@@ -219,7 +311,8 @@ def test_too_few_windows_raises(tmp_path):
     path = _periodic_shard(tmp_path, 40)  # (40 - 1) // 8 = 4 janelas de seq_len=8
     with pytest.raises(ValueError, match="janelas"):
         PackedTokenStream([path], seq_len=8, micro_batch=5, eos_id=0, seed=0)
-    stream = PackedTokenStream([path], seq_len=8, micro_batch=4, eos_id=0, seed=0)
+    # unit_len=16: 2 unidades = 4 janelas de 8, mas só 2 de 16
+    stream = PackedTokenStream([path], seq_len=8, micro_batch=4, eos_id=0, seed=0, unit_len=16)
     with pytest.raises(ValueError, match="janelas"):
         stream.set_shape(seq_len=16, micro_batch=4)
     # a falha não deixa o stream num estado quebrado

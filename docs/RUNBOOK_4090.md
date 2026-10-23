@@ -25,7 +25,11 @@ uv run pytest -q             # tudo passa; os testes @cuda/@fla têm de rodar, n
 
 Antes de lançar, edite `configs/b0_8_pretrain.yaml`:
 - `data_paths` e `eos_id` reais (hoje são placeholders, ver seção 6). Os shards são `uint32` com o
-  sidecar `.json` ao lado.
+  sidecar `.json` ao lado. O stream corta cada shard em unidades de 8192 tokens (o maior `seq_len`
+  dos estágios) e sorteia as unidades por época. No estágio de 4K cada unidade vira 2 janelas
+  seguidas. A troca para 8K continua a mesma época a partir da próxima unidade inteira, sem
+  reamostrar o que já foi visto. Um shard com menos de 8193 tokens não entra, e até 8192 tokens do
+  fim de cada shard ficam de fora. Prefira shards grandes.
 - `peak_tflops` fica no padrão 165 (pico BF16 denso da 4090) e só serve para o `mfu` do log.
 - `lr_muon` e `lr_adamw` (3e-3, padrão do `TrainConfig`) ainda não foram validados. Com o
   `match_rms_adamw` o lr do Muon tem a escala do AdamW, e o 0,02 da literatura vale para outra
