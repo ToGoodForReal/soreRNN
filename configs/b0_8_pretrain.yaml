@@ -12,6 +12,9 @@ stages:
 total_tokens: 50e9
 
 warmup_steps: 1000
-ckpt_every_tokens: 2.5e8
+# last.pt a cada ~95 passos; snapshot numerado a cada ~4.768 passos, guardando os 4 mais novos
+ckpt_every_tokens: 5e7
+snapshot_every_tokens: 2.5e9
+keep_snapshots: 4
 compile: true
 out_dir: runs/b0_8_pretrain

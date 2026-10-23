@@ -5,6 +5,10 @@ faz o backward de `loss_mb * n_mb / n_passo`: o loss do passo é a média ponder
 vêm o clip do grad norm, a guarda de passo não finito (zera os grads e não anda nenhum otimizador),
 o lr `initial_lr * wsd(step)` e o passo dos otimizadores. O estágio do currículo de contexto é o
 primeiro com `until_tokens > tokens_consumed`, avaliado no início de cada passo.
+
+Checkpoints (R27): `last.pt` a cada `ckpt_every_tokens`, snapshots numerados a cada
+`snapshot_every_tokens` (os `keep_snapshots` mais novos ficam) e `last.pt` na fronteira do passo
+depois de um SIGINT/SIGTERM.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import contextlib
 import json
 import math
 import random
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,13 +139,69 @@ def _json_float(x: float) -> float | None:
     return x if math.isfinite(x) else None  # JSON estrito: NaN/Inf viram null
 
 
+# Sinais repetidos dentro desse intervalo contam como um só pedido de parada: com `uv run`, um
+# Ctrl-C chega duas vezes ao Python (o SIGINT do terminal e o repassado pelo uv).
+_SIGNAL_REPEAT_S = 1.0
+
+
+@contextlib.contextmanager
+def _stop_on_signals():
+    """Durante o bloco, SIGINT/SIGTERM só pedem parada: devolve a lista que recebe o nº do sinal.
+
+    Um 2º sinal (depois de `_SIGNAL_REPEAT_S`) reinstala os handlers anteriores e tem o efeito
+    padrão: Ctrl-C de novo interrompe na hora, SIGTERM de novo encerra. Ao sair do bloco os
+    handlers anteriores voltam. Fora da thread principal (onde o Python não aceita handlers) nada
+    é instalado.
+    """
+    stop: list[int] = []
+    if threading.current_thread() is not threading.main_thread():
+        yield stop
+        return
+    signums = (signal.SIGINT, signal.SIGTERM)
+    previous = {s: signal.getsignal(s) for s in signums}
+    first_at = 0.0
+
+    def restore() -> None:
+        for s, handler in previous.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+
+    def request_stop(signum, frame) -> None:
+        nonlocal first_at
+        now = time.monotonic()
+        if not stop:
+            stop.append(signum)
+            first_at = now
+        elif now - first_at > _SIGNAL_REPEAT_S:
+            restore()
+            signal.raise_signal(signum)  # agora com o handler anterior
+
+    for s in signums:
+        signal.signal(s, request_stop)
+    try:
+        yield stop
+    finally:
+        restore()
+
+
+def _crossed(before: int, after: int, every: int) -> bool:
+    """True se `[before, after)` cruzou um múltiplo de `every` (`every = 0` desliga)."""
+    return every > 0 and after // every > before // every
+
+
 def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = None) -> TrainSummary:
     """Treina até `total_steps` ou até `max_steps` passos nesta chamada (o que vier antes).
 
-    `resume` restaura modelo, otimizadores, RNG, cursor de dados e contadores de um `last.pt`.
+    `resume` restaura modelo, otimizadores, RNG, cursor de dados e contadores de um `last.pt`. Sem
+    `resume`, recusa um `out_dir` que já tem `last.pt` (FileExistsError). SIGINT/SIGTERM param o
+    treino na fronteira do passo, com `last.pt` salvo, e `train` retorna normalmente.
     """
     device = resolve_device(cfg.device)
     out_dir = Path(cfg.out_dir)
+    if resume is None and (out_dir / "last.pt").exists():
+        raise FileExistsError(
+            f"{out_dir / 'last.pt'} já existe: para continuar esse treino use --resume {out_dir / 'last.pt'}; "
+            "para um treino novo, use outro out_dir"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(cfg.seed)
@@ -161,7 +223,11 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
         stream.load_state_dict(data_state)
         step, skipped, last_loss = train_state["step"], train_state["skipped_steps"], train_state["last_loss"]
 
-    def checkpoint() -> None:
+    def checkpoint(snapshot: bool = False) -> None:
+        """`last.pt` e, com `snapshot`, também `snapshot_step{step}.pt` (o mesmo conteúdo).
+
+        Ficam só os `keep_snapshots` snapshots mais novos (o nome com 8 dígitos ordena por passo).
+        """
         train_state = {
             "step": step,
             "skipped_steps": skipped,
@@ -169,7 +235,13 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
             "last_loss": last_loss,
             "config": cfg.to_dict(),
         }
-        save_checkpoint(out_dir / "last.pt", model, optimizers, stream.state_dict(), train_state)
+        paths = [out_dir / "last.pt"] + ([out_dir / f"snapshot_step{step:08d}.pt"] if snapshot else [])
+        for path in paths:
+            save_checkpoint(path, model, optimizers, stream.state_dict(), train_state)
+        if snapshot:
+            print(f"[ckpt] snapshot {paths[1].name}", flush=True)
+            for old in sorted(out_dir.glob("snapshot_step*.pt"))[: -cfg.keep_snapshots]:
+                old.unlink()
 
     total_steps = cfg.total_steps
     print(
@@ -178,8 +250,8 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
         flush=True,
     )
     attempts, saved_at = 0, None
-    with open(out_dir / "metrics.jsonl", "a") as log:
-        while step < total_steps and (max_steps is None or attempts < max_steps):
+    with _stop_on_signals() as stop, open(out_dir / "metrics.jsonl", "a") as log:
+        while step < total_steps and (max_steps is None or attempts < max_steps) and not stop:
             if _sync_stage(stream, cfg.stages):
                 print(f"[stage] tokens={stream.tokens_consumed}: seq_len={stream.seq_len} "
                       f"micro_batch={stream.micro_batch}", flush=True)
@@ -215,11 +287,15 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                     + (" | SKIPPED (grad norm não finito)" if stats["skipped"] else ""),
                     flush=True,
                 )
-            if stream.tokens_consumed // cfg.ckpt_every_tokens > tokens_before // cfg.ckpt_every_tokens:
-                checkpoint()
+            snapshot = _crossed(tokens_before, stream.tokens_consumed, cfg.snapshot_every_tokens)
+            if snapshot or _crossed(tokens_before, stream.tokens_consumed, cfg.ckpt_every_tokens):
+                checkpoint(snapshot)
                 saved_at = step
-    if saved_at != step:
-        checkpoint()
+        if saved_at != step:
+            checkpoint()
+        if stop:
+            print(f"[train] {signal.Signals(stop[0]).name}: parada no passo {step} com last.pt salvo; "
+                  f"retome com --resume {out_dir / 'last.pt'}", flush=True)
 
     summary = TrainSummary(steps=step, tokens=stream.tokens_consumed, skipped_steps=skipped, last_loss=last_loss)
     print(f"[train] fim: {summary}", flush=True)

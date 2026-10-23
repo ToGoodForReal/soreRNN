@@ -2,6 +2,9 @@
 import dataclasses
 import json
 import math
+import os
+import signal
+import time
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +12,7 @@ import pytest
 import torch
 
 import sore.model.lm as lm_module
+import sore.train.trainer as trainer_module
 from sore.model import get_preset
 from sore.model.flops import flops_per_token
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
@@ -215,6 +219,114 @@ def test_metrics_include_mfu(tmp_path):
         assert m["mfu"] == pytest.approx(expected, rel=1e-12) and m["mfu"] > 0
 
 
+# --- checkpoints e sinais (R27) ---------------------------------------------------------------
+
+
+def _record_saves(monkeypatch) -> list[tuple[str, int]]:
+    """Grava `(nome do arquivo, train_state["step"])` de cada `save_checkpoint` do trainer."""
+    saves = []
+    real = trainer_module.save_checkpoint
+
+    def recording(path, model, optimizers, data_state, train_state):
+        saves.append((Path(path).name, train_state["step"]))
+        real(path, model, optimizers, data_state, train_state)
+
+    monkeypatch.setattr(trainer_module, "save_checkpoint", recording)
+    return saves
+
+
+def test_refuses_to_overwrite_existing_run(tmp_path):
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
+    train(cfg, max_steps=1)
+    with pytest.raises(FileExistsError, match="--resume .*last.pt"):
+        train(cfg)
+    assert len(_metrics(cfg.out_dir)) == 1  # a 2a chamada não treinou nem escreveu nada
+
+
+def test_periodic_checkpoint(tmp_path, monkeypatch):
+    saves = _record_saves(monkeypatch)
+    shard = _shard(tmp_path / "s.bin", 1000)
+    # 128 tokens por passo: ckpt a cada 2 passos e o final no passo 5
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, ckpt_every_tokens=2 * 128)
+    train(cfg, max_steps=5)
+    assert saves == [("last.pt", 2), ("last.pt", 4), ("last.pt", 5)]
+
+
+def test_snapshots_keep_the_newest(tmp_path, monkeypatch):
+    saves = _record_saves(monkeypatch)
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(
+        tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, snapshot_every_tokens=128, keep_snapshots=2
+    )
+    train(cfg, max_steps=5)
+
+    # cada snapshot sai junto com um last.pt do mesmo passo
+    assert saves == [(name, s) for s in range(1, 6) for name in ("last.pt", f"snapshot_step{s:08d}.pt")]
+    out = Path(cfg.out_dir)
+    snaps = sorted(p.name for p in out.glob("snapshot_step*.pt"))
+    assert snaps == ["snapshot_step00000004.pt", "snapshot_step00000005.pt"]  # só os 2 mais novos
+    assert not list(out.glob("*.tmp"))
+    last = torch.load(out / "last.pt", weights_only=True)
+    newest = torch.load(out / snaps[-1], weights_only=True)
+    assert newest["train_state"] == last["train_state"] and newest["train_state"]["step"] == 5
+    for name, value in last["model"].items():
+        assert torch.equal(newest["model"][name], value), name
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_signal_saves_at_step_boundary(tmp_path, monkeypatch, capsys, signum):
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
+    before = signal.getsignal(signum)
+    original = lm_module.SoreLM.forward
+    calls = []
+
+    def forward_signal_on_step_2(self, *args, **kwargs):
+        calls.append(signal.getsignal(signum))
+        if len(calls) == 2:
+            assert calls[-1] is not before  # o handler do trainer está instalado (senão não envia)
+            # Ctrl-C sob `uv run`: o Python recebe o SIGINT do terminal e o repassado pelo uv
+            os.kill(os.getpid(), signum)
+            os.kill(os.getpid(), signum)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(lm_module.SoreLM, "forward", forward_signal_on_step_2)
+    summary = train(cfg)
+
+    assert summary.steps == 2 and len(calls) == 2  # o passo 2 terminou e o treino parou na fronteira
+    assert torch.load(Path(cfg.out_dir) / "last.pt", weights_only=True)["train_state"]["step"] == 2
+    assert [m["step"] for m in _metrics(cfg.out_dir)] == [1, 2]
+    assert signal.getsignal(signum) is before  # restaurado na saída do train()
+    out = capsys.readouterr().out
+    assert signal.Signals(signum).name in out and "last.pt" in out
+
+
+def test_second_signal_has_default_effect(tmp_path, monkeypatch):
+    # um 2º SIGINT depois da janela de repetição volta ao efeito padrão: KeyboardInterrupt na hora
+    monkeypatch.setattr(trainer_module, "_SIGNAL_REPEAT_S", 0.0)
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
+    before = signal.getsignal(signal.SIGINT)
+    original = lm_module.SoreLM.forward
+    calls = []
+
+    def forward_two_signals_on_step_2(self, *args, **kwargs):
+        calls.append(None)
+        if len(calls) == 2:
+            assert signal.getsignal(signal.SIGINT) is not before
+            os.kill(os.getpid(), signal.SIGINT)  # 1º: pede a parada
+            time.sleep(0.01)
+            os.kill(os.getpid(), signal.SIGINT)  # 2º: efeito padrão
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(lm_module.SoreLM, "forward", forward_two_signals_on_step_2)
+    with pytest.raises(KeyboardInterrupt):
+        train(cfg)
+    assert len(calls) == 2
+    assert signal.getsignal(signal.SIGINT) is before
+
+
 def test_compile_model_compiles_each_block_in_place(monkeypatch):
     # helper compartilhado pelo trainer e pelo scripts/bench.py: Module.compile() em cada Block do
     # tronco, no Block do MTP e na cross-entropy dos chunks da loss (N estático), com
@@ -339,6 +451,7 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
     )
     assert TrainConfig.lr_muon == TrainConfig.lr_adamw
     assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 165.0)
+    assert (cfg.snapshot_every_tokens, cfg.keep_snapshots) == (0, 3)  # snapshots desligados por padrão
 
 
 def test_load_train_config_peak_tflops(tmp_path):
@@ -369,11 +482,13 @@ def test_load_train_config_peak_tflops(tmp_path):
         (GOOD_STAGES, "50e9", "seq_length: 4096\n", "desconhecid"),
         (GOOD_STAGES, "50e9", "warmup_steps: 2.5\n", "warmup_steps"),
         (GOOD_STAGES, "50e9", "peak_tflops: 0\n", "peak_tflops"),
+        (GOOD_STAGES, "50e9", "snapshot_every_tokens: -1\n", "snapshot_every_tokens deve ser >= 0"),
+        (GOOD_STAGES, "50e9", "keep_snapshots: 0\n", "keep_snapshots deve ser >= 1"),
     ],
     ids=[
         "tokens_per_microbatch", "not_ascending", "seq_len_not_divisor", "last_below_total", "empty",
         "unknown_key", "fractional",
-        "peak_tflops_zero",
+        "peak_tflops_zero", "snapshot_negative", "keep_zero",
     ],
 )
 def test_load_train_config_rejects_invalid(tmp_path, stages, total, extra, match):
@@ -402,6 +517,8 @@ def test_b0_8_config_values():
     assert cfg.stages == [Stage(35_000_000_000, 4096, 2), Stage(50_000_000_000, 8192, 1)]
     assert (cfg.total_tokens, cfg.grad_accum, cfg.compile) == (50_000_000_000, 64, True)
     assert cfg.model_overrides == {"grad_checkpoint": True}
+    # R27: last.pt a cada 5e7 tokens (~95 passos) e 4 snapshots numerados, um a cada 2,5e9
+    assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens, cfg.keep_snapshots) == (50_000_000, 2_500_000_000, 4)
 
 
 def test_resolve_data_paths(tmp_path):

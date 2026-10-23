@@ -52,7 +52,10 @@ class Stage:
             raise ValueError(f"estágio com seq_len/micro_batch < 1: {self}")
 
 
-_INT_FIELDS = ("eos_id", "grad_accum", "total_tokens", "warmup_steps", "log_every", "ckpt_every_tokens", "seed")
+_INT_FIELDS = (
+    "eos_id", "grad_accum", "total_tokens", "warmup_steps", "log_every", "ckpt_every_tokens",
+    "snapshot_every_tokens", "keep_snapshots", "seed",
+)
 _FLOAT_FIELDS = ("lr_muon", "lr_adamw", "decay_frac", "weight_decay", "grad_clip", "peak_tflops")
 
 
@@ -77,10 +80,12 @@ class TrainConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 
-    # Execução (`out_dir` é o diretório do run: metrics.jsonl e last.pt ficam nele)
+    # Execução (`out_dir` é o diretório do run: metrics.jsonl, last.pt e os snapshots ficam nele)
     compile: bool = False
     log_every: int = 10
     ckpt_every_tokens: int
+    snapshot_every_tokens: int = 0  # snapshot_step{passo}.pt numerado a cada N tokens; 0 = desligado
+    keep_snapshots: int = 3  # só os N snapshots mais novos ficam no disco
     out_dir: str
     seed: int = 0
     device: str = "auto"  # "auto" -> "cuda" se disponível, senão "cpu"
@@ -101,6 +106,10 @@ class TrainConfig:
             raise ValueError("grad_accum, log_every e ckpt_every_tokens devem ser >= 1")
         if self.peak_tflops <= 0:
             raise ValueError(f"peak_tflops deve ser > 0, recebeu {self.peak_tflops}")
+        if self.snapshot_every_tokens < 0:
+            raise ValueError(f"snapshot_every_tokens deve ser >= 0 (0 desliga), recebeu {self.snapshot_every_tokens}")
+        if self.keep_snapshots < 1:
+            raise ValueError(f"keep_snapshots deve ser >= 1, recebeu {self.keep_snapshots}")
         per_micro = {s.seq_len * s.micro_batch for s in self.stages}
         if len(per_micro) != 1:
             # tokens por passo constantes => o schedule por passo (WSD) é exato entre estágios

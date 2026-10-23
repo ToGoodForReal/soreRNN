@@ -10,7 +10,8 @@ Operação do pré-treino de ~6–7 semanas do preset `b0_8` numa RTX 4090 24GB 
 | Estágios | 4096 × micro_batch 2 até 35B tokens (~passo 66.758), depois 8192 × 1 |
 | LR | 3e-3 no Muon e no AdamW. WSD: warmup de 1.000 passos, platô, decay nos últimos 20% (a partir do passo ~76.294) |
 | FLOPs de treino por token | 5,48 GFLOP a 4K e 5,70 GFLOP a 8K (`sore/model/flops.py`) |
-| Checkpoint | `runs/b0_8_pretrain/last.pt` a cada 2,5e8 tokens (~477 passos), ~6–7 GB cada |
+| Checkpoint | `runs/b0_8_pretrain/last.pt` a cada 5e7 tokens (~95 passos, ~70 min a 12K tok/s), ~6–7 GB |
+| Snapshots | `snapshot_stepNNNNNNNN.pt` a cada 2,5e9 tokens (~4.768 passos, ~2,4 dias); ficam os 4 mais novos |
 
 ## 1. Setup
 
@@ -85,9 +86,13 @@ Use `tmux` para o treino sobreviver à queda da sessão SSH:
 ```bash
 tmux new -s pretrain
 mkdir -p runs/b0_8_pretrain
-uv run python -m sore.train --config configs/b0_8_pretrain.yaml 2>&1 | tee -a runs/b0_8_pretrain/train.log
+uv run python -m sore.train --config configs/b0_8_pretrain.yaml 2>&1 | tee -ia runs/b0_8_pretrain/train.log
 # Ctrl-b d para destacar; `tmux attach -t pretrain` para voltar
 ```
+
+O `-i` do `tee` é obrigatório. O Ctrl-C vai para o grupo inteiro (uv, python e tee). Sem `-i` o
+`tee` morre, o próximo `print` do trainer dá `BrokenPipeError` e o processo cai sem salvar o
+`last.pt` (testado).
 
 O 1º passo é lento porque é nele que o `torch.compile` compila cada Block. A troca para 8K **não**
 recompila: N = `seq_len × micro_batch` = 8192 nos dois estágios e o nº de documentos do micro-batch
@@ -95,26 +100,34 @@ já entra dinâmico. A única variante extra é a de um micro-batch com um docum
 (`cu_seqlens = [0, N]`, comum no estágio 8192 × 1), compilada uma vez quando aparece pela 1ª vez.
 O `tok_s`/`mfu` desses passos é ruído.
 
-Opcional, numa segunda janela do tmux: o trainer guarda só um `last.pt` (troca atômica). Uma
-cópia periódica permite voltar atrás em caso de divergência. Cada cópia tem ~6–7 GB, então apague
-as antigas:
+Se `runs/b0_8_pretrain/last.pt` já existir, o comando acima recusa começar do zero
+(`FileExistsError`) para não sobrescrever o treino: use `--resume` (seção 4) ou outro `out_dir`.
 
-```bash
-while sleep 43200; do cp runs/b0_8_pretrain/last.pt "runs/b0_8_pretrain/bak_$(date +%m%d_%H%M).pt"; done
-```
+Checkpoints (`configs/b0_8_pretrain.yaml`):
+- `ckpt_every_tokens: 5e7`: `last.pt` (troca atômica) a cada ~95 passos.
+- `snapshot_every_tokens: 2.5e9` e `keep_snapshots: 4`: no mesmo passo do `last.pt` sai também
+  `snapshot_stepNNNNNNNN.pt` (mesmo conteúdo), e só os 4 mais novos ficam no disco. Servem para
+  voltar ~2,4–9,5 dias em caso de divergência. Reserve ~35 GB para `last.pt` + 4 snapshots (mais um
+  `.tmp` durante a gravação). `snapshot_every_tokens: 0` desliga.
 
 ## 4. Retomada
 
 Depois de queda, reboot ou parada manual, rode no tmux:
 
 ```bash
-uv run python -m sore.train --config configs/b0_8_pretrain.yaml --resume runs/b0_8_pretrain/last.pt 2>&1 | tee -a runs/b0_8_pretrain/train.log
+uv run python -m sore.train --config configs/b0_8_pretrain.yaml --resume runs/b0_8_pretrain/last.pt 2>&1 | tee -ia runs/b0_8_pretrain/train.log
 ```
 
 A retomada restaura modelo, otimizadores, RNG, cursor de dados, estágio e contadores, e continua
-exatamente do último checkpoint. O que veio depois dele é refeito. Para uma parada planejada,
-espere um `last.pt` recente (`ls -l --time-style=full-iso runs/b0_8_pretrain/last.pt`) e dê
-Ctrl-C. Veja as limitações na seção 6.
+exatamente do último checkpoint. O que veio depois dele é refeito. Para voltar a um snapshot, passe
+o arquivo dele em `--resume`.
+
+**Parada planejada:** dê Ctrl-C uma vez no tmux (ou `kill -TERM` no PID do `uv`, que repassa o
+sinal ao Python). O passo em andamento termina (~45 s a 12K tok/s), o `last.pt` é salvo, o log
+mostra `[train] SIGINT: parada no passo N com last.pt salvo` e o processo sai normalmente. Sob
+`uv run`, um Ctrl-C chega duas vezes ao Python (o do terminal e o repassado pelo uv). Por isso
+sinais repetidos em até 1 s contam como um só. Um 2º Ctrl-C/SIGTERM depois disso tem o efeito
+padrão e interrompe na hora, sem salvar. Veja as limitações na seção 6.
 
 ## 5. O que monitorar em `metrics.jsonl`
 
@@ -165,8 +178,9 @@ toda vez que um passo é pulado) e `nvidia-smi dmon -s pucm` (potência, clocks 
   param groups, como `weight_decay`) volta do checkpoint.
 - **`metrics.jsonl` pode repetir passos depois de crash + retomada.** Os passos após o último
   checkpoint são refeitos e gravados de novo. Para cada `step`, vale o último registro.
-- **Não há checkpoint no SIGTERM nem no Ctrl-C.** Perde-se até `ckpt_every_tokens` de trabalho:
-  2,5e8 tokens no `b0_8`, ~477 passos, ~6 h a 12K tok/s.
+- **Crash sem sinal perde até `ckpt_every_tokens` de trabalho.** Queda de energia, OOM ou
+  `kill -9` não passam pelo handler de SIGINT/SIGTERM. No `b0_8` isso é até 5e7 tokens, ~95
+  passos, ~70 min a 12K tok/s.
 - **Memória transitória da loss.** O `chunked_lm_loss` usa por padrão `chunk_size` 8192 × vocab
   65.536, o que dá ≈ 2–3 GB transitórios por chunk (LM e MTP). Se o estágio de 8K der OOM, baixe o
   padrão em `sore/model/loss.py` (ex.: 2048) e repita o portão.
