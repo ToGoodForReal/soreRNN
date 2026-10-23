@@ -168,10 +168,16 @@ def test_flex_backward_matches_sdpa():
     torch.manual_seed(2)
     x = torch.randn(1, 300, 128, device="cuda")
     cu = _cu([0, 120, 300], device="cuda")
+    names = ["x", *(n for n, _ in sdpa.named_parameters())]
     grads = []
     for layer in (sdpa, flex):
         xi = x.clone().requires_grad_()
-        layer(xi, cu).square().mean().backward()
+        # soma (não média): o gradiente não encolhe com T*D, então a tolerância relativa tem sentido
+        layer(xi, cu).square().sum().backward()
         grads.append([xi.grad, *(p.grad for p in layer.parameters())])
-    for g_ref, g_flex in zip(*grads):
-        torch.testing.assert_close(g_flex, g_ref, atol=2e-3, rtol=1e-3)
+    for name, g_ref, g_flex in zip(names, *grads):
+        scale = g_ref.abs().max().item()
+        assert scale > 1e-2, f"gradiente de referência degenerado em {name}: max|g|={scale:.2e}"
+        # tolerância relativa à magnitude do próprio gradiente: gradiente zerado nunca passa
+        diff = (g_flex - g_ref).abs().max().item()
+        assert diff <= 1e-3 * scale, f"{name}: max|dg|={diff:.2e} vs max|g|={scale:.2e}"
