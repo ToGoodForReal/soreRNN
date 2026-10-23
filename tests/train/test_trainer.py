@@ -197,6 +197,25 @@ def test_step_loss_is_token_weighted_mean(tmp_path, monkeypatch):
     assert metrics["grad_norm"] == pytest.approx(ref_norm.item(), rel=1e-5)
 
 
+def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
+    # torch 2.14.1: o Inductor quebra no backward com mix_order_reduction ligado; o trainer desliga
+    # antes de compilar. torch.compile é trocado por identidade (teste barato, sem compilar nada).
+    import torch._inductor.config as inductor_config
+
+    monkeypatch.setattr(inductor_config.triton, "mix_order_reduction", True)  # restaurado ao fim
+    compiled = []
+
+    def fake_compile(model, *args, **kwargs):
+        compiled.append(inductor_config.triton.mix_order_reduction)
+        return model
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, compile=True)
+    assert train(cfg, max_steps=1).steps == 1
+    assert compiled == [False]  # flag já desligada quando torch.compile é chamado
+
+
 # --- config -----------------------------------------------------------------------------------
 
 BASE_YAML = """\

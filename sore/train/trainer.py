@@ -119,7 +119,15 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     model = SoreLM(get_preset(cfg.model_preset, **cfg.model_overrides)).to(device)
     # otimizadores sobre o módulo sem wrapper: a divisão Muon/AdamW depende dos nomes dos parâmetros
     optimizers = build_optimizers(model, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay)
-    fwd = torch.compile(model) if cfg.compile else model
+    fwd = model
+    if cfg.compile:
+        # torch 2.14.1: a fusão "mix order reduction" do Inductor quebra no 1º backward do SoreLM
+        # (InductorError: AssertionError "509 v.s. 510" em MixOrderReduction.get_numel_rnumel).
+        # Desligada até o fix upstream; equivale a TORCHINDUCTOR_MIX_ORDER_REDUCTION=0.
+        import torch._inductor.config as inductor_config
+
+        inductor_config.triton.mix_order_reduction = False
+        fwd = torch.compile(model)
     first = cfg.stages[0]
     stream = PackedTokenStream(
         resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed
