@@ -1,4 +1,4 @@
-"""Schedule de LR warmup-stable-decay (WSD)."""
+"""Schedules por passo: LR warmup-stable-decay (WSD) e rampa linear (λ do MTP)."""
 from __future__ import annotations
 
 import math
@@ -32,3 +32,14 @@ def wsd_multiplier(step: int, warmup: int, total: int, decay_frac: float) -> flo
     else:
         mult = 1.0 - math.sqrt((step - decay_start) / (total - decay_start))
     return min(1.0, max(0.0, mult))
+
+
+def linear_schedule(step: int, total: int, start: float, end: float) -> float:
+    """`start` no passo 0 e `end` no último passo (`total - 1`), linear entre eles; `end` depois do fim.
+
+    Usado no peso λ do MTP (ruling R23: 0.3 -> 0.1 ao longo do treino).
+    """
+    if total <= 0:
+        raise ValueError(f"total deve ser > 0, recebeu {total}")
+    frac = min(1.0, max(0.0, step / max(total - 1, 1)))
+    return start + (end - start) * frac

@@ -1,9 +1,9 @@
-"""Testes do multiplicador de LR warmup-stable-decay (WSD)."""
+"""Testes do multiplicador de LR warmup-stable-decay (WSD) e da rampa linear (λ do MTP)."""
 import math
 
 import pytest
 
-from sore.train.schedule import wsd_multiplier
+from sore.train.schedule import linear_schedule, wsd_multiplier
 
 
 def test_wsd_points():
@@ -68,3 +68,14 @@ def test_wsd_all_decay():
 def test_wsd_rejects_invalid_args(args):
     with pytest.raises(ValueError):
         wsd_multiplier(*args)
+
+
+def test_linear_schedule_endpoints_and_mid():
+    # λ do MTP (R23): 0.3 no passo 0 e 0.1 no último passo (total - 1), linear no meio
+    assert linear_schedule(0, 101, 0.3, 0.1) == 0.3
+    assert linear_schedule(50, 101, 0.3, 0.1) == pytest.approx(0.2)
+    assert linear_schedule(100, 101, 0.3, 0.1) == pytest.approx(0.1)
+    assert linear_schedule(150, 101, 0.3, 0.1) == pytest.approx(0.1)  # depois do fim fica no valor final
+    assert linear_schedule(0, 1, 0.3, 0.1) == 0.3  # um passo só
+    with pytest.raises(ValueError):
+        linear_schedule(0, 0, 0.3, 0.1)

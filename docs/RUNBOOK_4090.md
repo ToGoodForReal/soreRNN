@@ -136,7 +136,9 @@ Cada passo grava uma linha JSON em `runs/b0_8_pretrain/metrics.jsonl`:
 | Campo | O que é | Esperado / alerta |
 |---|---|---|
 | `step`, `tokens` | passo (1-based) e tokens consumidos | crescem 1 e 524.288 por linha |
-| `loss`, `lm_loss`, `mtp_loss` | `lm + 0,3·mtp`, médias ponderadas por token | caem. O `mtp_loss` fica acima do `lm_loss` (prevê t+2). Spike sustentado: investigar |
+| `loss`, `lm_loss`, `mtp_loss` | `lm + λ·mtp`, médias ponderadas por token | caem. O `mtp_loss` fica acima do `lm_loss` (prevê t+2). O `loss` cai também porque o λ cai |
+| `mtp_weight` | λ do MTP no passo: linear de `mtp_weight_start` (padrão: o `mtp_weight` do modelo, 0,3) até `mtp_weight_end` (0,1) no último passo | 0,3 → 0,1 |
+| `spike` | depois do warmup, `loss > (1 + spike_threshold) × EMA` do loss (beta 0,98; `spike_threshold` 0,3). O passo com spike não entra na EMA | raro. Gera `[spike] passo N: ...` no `train.log`. Vários seguidos: investigar e, se for o caso, voltar a um snapshot |
 | `grad_norm` | norma antes do clip (1,0) | estável depois do warmup. Subida contínua ou picos frequentes ≫ 1 indicam instabilidade |
 | `skipped` | passo pulado por grad norm não finito (`loss`/`grad_norm` viram `null`) | raro. Vários seguidos: parar e investigar |
 | `lr_muon` | lr do Muon (`initial_lr × wsd`), antes da escala `0,2·√max(A, B)` do `match_rms_adamw` | sobe por 1.000 passos, platô em 3e-3, decai a partir do passo ~76.294 |
@@ -160,13 +162,15 @@ def mean(k):
 r = last[-1]
 print(f"passo {r['step']} | {r['tokens'] / 1e9:.2f}B tokens | seq {r['seq_len']} | loss {mean('loss'):.4f} "
       f"(mtp {mean('mtp_loss'):.4f}) | gnorm {mean('grad_norm'):.3f} | lr {r['lr_muon']:.2e} | "
-      f"{mean('tok_s'):,.0f} tok/s | MFU {mean('mfu'):.1%} | {r['mem_gb']:.1f} GB | "
-      f"pulados {sum(x['skipped'] for x in recs.values())}")
+      f"{mean('tok_s'):,.0f} tok/s | MFU {mean('mfu'):.1%} | {r['mem_gb']:.1f} GB | λ {r['mtp_weight']:.3f} | "
+      f"pulados {sum(x['skipped'] for x in recs.values())} | spikes {sum(x['spike'] for x in recs.values())}")
 EOF
 ```
 
-Acompanhe também `tail -f runs/b0_8_pretrain/train.log` (uma linha a cada `log_every` passos e
-toda vez que um passo é pulado) e `nvidia-smi dmon -s pucm` (potência, clocks e memória).
+Acompanhe também `tail -f runs/b0_8_pretrain/train.log` (uma linha a cada `log_every` passos, toda
+vez que um passo é pulado e a cada `[spike]`) e `nvidia-smi dmon -s pucm` (potência, clocks e
+memória). O `mtp_weight` do `ModelConfig` pode mudar na retomada (campo de execução), mas no
+treino quem manda é o λ do `TrainConfig`.
 
 ## 6. Problemas conhecidos
 

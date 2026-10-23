@@ -56,7 +56,10 @@ _INT_FIELDS = (
     "eos_id", "grad_accum", "total_tokens", "warmup_steps", "log_every", "ckpt_every_tokens",
     "snapshot_every_tokens", "keep_snapshots", "seed",
 )
-_FLOAT_FIELDS = ("lr_muon", "lr_adamw", "decay_frac", "weight_decay", "grad_clip", "peak_tflops")
+_FLOAT_FIELDS = (
+    "lr_muon", "lr_adamw", "decay_frac", "weight_decay", "grad_clip", "mtp_weight_end", "spike_threshold",
+    "peak_tflops",
+)
 
 
 @dataclass(kw_only=True)
@@ -79,6 +82,12 @@ class TrainConfig:
     decay_frac: float = 0.2
     weight_decay: float = 0.1
     grad_clip: float = 1.0
+    # λ do MTP no loss do passo (R23): linear de `mtp_weight_start` (None = o `mtp_weight` do
+    # modelo) no passo 0 até `mtp_weight_end` no último passo
+    mtp_weight_start: float | None = None
+    mtp_weight_end: float = 0.1
+    # alerta de spike: loss do passo > EMA (beta 0.98, depois do warmup) × (1 + spike_threshold)
+    spike_threshold: float = 0.3
 
     # Execução (`out_dir` é o diretório do run: metrics.jsonl, last.pt e os snapshots ficam nele)
     compile: bool = False
@@ -96,6 +105,8 @@ class TrainConfig:
             setattr(self, name, _as_int(name, getattr(self, name)))
         for name in _FLOAT_FIELDS:
             setattr(self, name, _as_float(name, getattr(self, name)))
+        if self.mtp_weight_start is not None:
+            self.mtp_weight_start = _as_float("mtp_weight_start", self.mtp_weight_start)
         self.stages = [s if isinstance(s, Stage) else Stage(**s) for s in self.stages]
         self._validate()
 
@@ -110,6 +121,12 @@ class TrainConfig:
             raise ValueError(f"snapshot_every_tokens deve ser >= 0 (0 desliga), recebeu {self.snapshot_every_tokens}")
         if self.keep_snapshots < 1:
             raise ValueError(f"keep_snapshots deve ser >= 1, recebeu {self.keep_snapshots}")
+        if self.spike_threshold <= 0:
+            raise ValueError(f"spike_threshold deve ser > 0, recebeu {self.spike_threshold}")
+        for name in ("mtp_weight_start", "mtp_weight_end"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} deve ser >= 0, recebeu {value}")
         per_micro = {s.seq_len * s.micro_batch for s in self.stages}
         if len(per_micro) != 1:
             # tokens por passo constantes => o schedule por passo (WSD) é exato entre estágios

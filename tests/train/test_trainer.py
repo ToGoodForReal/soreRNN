@@ -17,7 +17,7 @@ from sore.model import get_preset
 from sore.model.flops import flops_per_token
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
 from sore.train.data import write_token_shard
-from sore.train.trainer import TrainSummary, compile_model, train
+from sore.train.trainer import LossSpikeDetector, TrainSummary, compile_model, train
 
 REPO = Path(__file__).resolve().parents[2]
 CPU_BACKENDS = {"gdn_backend": "torch", "attn_backend": "sdpa"}
@@ -85,8 +85,11 @@ def test_overfit(tmp_path):
     assert [m["step"] for m in metrics] == list(range(1, 41))
     assert set(metrics[0]) >= {
         "step", "tokens", "loss", "lm_loss", "mtp_loss", "grad_norm", "lr_muon", "tok_s", "mem_gb",
-        "seq_len", "skipped", "mfu",
+        "seq_len", "skipped", "mfu", "mtp_weight", "spike",
     }
+    # λ do MTP: o mtp_weight do modelo (0.3) no 1º passo até mtp_weight_end (0.1) no último
+    assert metrics[0]["mtp_weight"] == pytest.approx(0.3) and metrics[-1]["mtp_weight"] == pytest.approx(0.1)
+    assert not any(m["spike"] for m in metrics)
     losses = [m["loss"] for m in metrics]
     assert summary.last_loss == pytest.approx(losses[-1])
     assert losses[-1] < 0.5 * losses[0], losses
@@ -130,8 +133,11 @@ def test_resume_equivalence(tmp_path, straight_run, split):
     for name, value in final_straight.items():
         torch.testing.assert_close(final[name], value, rtol=0, atol=1e-5, msg=name)
     # R22: unidades do tamanho do maior seq_len, então a troca 32 -> 64 não reamostra o corpus
-    data_state = torch.load(Path(cfg.out_dir) / "last.pt", weights_only=True)["data_state"]
-    assert data_state["unit_len"] == 64
+    ckpt = torch.load(Path(cfg.out_dir) / "last.pt", weights_only=True)
+    assert ckpt["data_state"]["unit_len"] == 64
+    # a EMA do alerta de spike também é retomada
+    ema_straight = torch.load(Path(straight_cfg.out_dir) / "last.pt", weights_only=True)["train_state"]["loss_ema"]
+    assert ckpt["train_state"]["loss_ema"] == pytest.approx(ema_straight, rel=0, abs=1e-5)
 
 
 def test_nonfinite_step_skipped(tmp_path, monkeypatch):
@@ -146,7 +152,7 @@ def test_nonfinite_step_skipped(tmp_path, monkeypatch):
         snapshots.append({n: p.detach().clone() for n, p in self.named_parameters()})
         out = original(self, *args, **kwargs)
         if len(snapshots) == 2:
-            out.loss = out.loss * float("nan")
+            out.lm_loss = out.lm_loss * float("nan")  # o trainer monta o loss de lm_loss e mtp_loss (R23)
         return out
 
     monkeypatch.setattr(lm_module.SoreLM, "forward", forward_nan_on_step_2)
@@ -203,6 +209,79 @@ def test_step_loss_is_token_weighted_mean(tmp_path, monkeypatch):
         (ref(ids, cu_seqlens=cu, labels=labels).loss * out.n_tokens / total).backward()
     ref_norm = torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in ref.parameters() if p.grad is not None]))
     assert metrics["grad_norm"] == pytest.approx(ref_norm.item(), rel=1e-5)
+
+
+def test_step_loss_uses_mtp_weight_schedule(tmp_path, monkeypatch):
+    # R23: o trainer faz o backward de lm + λ(passo)·mtp (não do out.loss, que usa o mtp_weight do modelo)
+    shard = _shard(tmp_path / "s.bin", 4000)
+    cfg = _cfg(
+        tmp_path / "run", shard, [Stage(5 * 128, 32, 4)], steps=5, warmup_steps=0,
+        mtp_weight_start=0.9, mtp_weight_end=0.1,
+    )
+    original = lm_module.SoreLM.forward
+    calls, initial = [], {}
+
+    def recording_forward(self, input_ids, cu_seqlens=None, labels=None, **kwargs):
+        if not initial:
+            initial.update({k: v.detach().clone() for k, v in self.state_dict().items()})
+        calls.append((input_ids.clone(), cu_seqlens.clone(), labels.clone()))
+        return original(self, input_ids, cu_seqlens=cu_seqlens, labels=labels, **kwargs)
+
+    monkeypatch.setattr(lm_module.SoreLM, "forward", recording_forward)
+    train(cfg)
+    monkeypatch.undo()
+
+    metrics = _metrics(cfg.out_dir)
+    np.testing.assert_allclose([m["mtp_weight"] for m in metrics], [0.9, 0.7, 0.5, 0.3, 0.1], rtol=1e-12)
+    for m in metrics:
+        assert m["loss"] == pytest.approx(m["lm_loss"] + m["mtp_weight"] * m["mtp_loss"], rel=1e-6)
+
+    # gradiente do passo 1 = o de lm + 0.9·mtp nos mesmos pesos e dados
+    ref = lm_module.SoreLM(get_preset("tiny", **CPU_BACKENDS))
+    ref.load_state_dict(initial)
+    ids, cu, labels = calls[0]
+    out = ref(ids, cu_seqlens=cu, labels=labels)
+    (out.lm_loss + 0.9 * out.mtp_loss).backward()
+    ref_norm = torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in ref.parameters() if p.grad is not None]))
+    assert metrics[0]["grad_norm"] == pytest.approx(ref_norm.item(), rel=1e-5)
+
+
+def test_spike_detector_ema():
+    det = LossSpikeDetector(threshold=0.3, beta=0.5)
+    assert det(2.0) is False and det.ema == 2.0  # a 1a chamada só inicializa a EMA
+    assert det(1.0) is False and det.ema == 1.5
+    assert det(1.96) is True and det.ema == 1.5  # > 1.5 * 1.3 = 1.95: spike não atualiza a EMA
+    assert det(1.94) is False and det.ema == pytest.approx(1.72)
+    assert det(math.nan) is False and det.ema == pytest.approx(1.72)  # não finito: ignorado
+
+
+def test_loss_spike_flag(tmp_path, monkeypatch, capsys):
+    shard = _shard(tmp_path / "s.bin", 4000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(12 * 128, 32, 4)], steps=12, warmup_steps=2)
+    original = lm_module.SoreLM.forward
+    calls = []
+
+    def forward_jump_on_step_8(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        calls.append(None)
+        if len(calls) == 8:  # grad_accum 1: o forward 8 é o passo 8
+            out.lm_loss, out.mtp_loss = out.lm_loss * 3, out.mtp_loss * 3
+        return out
+
+    monkeypatch.setattr(lm_module.SoreLM, "forward", forward_jump_on_step_8)
+    train(cfg)
+
+    assert [m["spike"] for m in _metrics(cfg.out_dir)] == [False] * 7 + [True] + [False] * 4
+    assert "[spike] passo 8" in capsys.readouterr().out
+
+
+def test_mtp_weight_can_change_on_resume(tmp_path):
+    # mtp_weight é campo de execução: não muda os pesos, então a retomada aceita outro valor
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
+    train(cfg, max_steps=1)
+    changed = dataclasses.replace(cfg, model_overrides={**CPU_BACKENDS, "mtp_weight": 0.5})
+    assert train(changed, resume=Path(cfg.out_dir) / "last.pt", max_steps=1).steps == 2
 
 
 def test_metrics_include_mfu(tmp_path):
@@ -452,6 +531,7 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
     assert TrainConfig.lr_muon == TrainConfig.lr_adamw
     assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 165.0)
     assert (cfg.snapshot_every_tokens, cfg.keep_snapshots) == (0, 3)  # snapshots desligados por padrão
+    assert (cfg.mtp_weight_start, cfg.mtp_weight_end, cfg.spike_threshold) == (None, 0.1, 0.3)
 
 
 def test_load_train_config_peak_tflops(tmp_path):
@@ -484,11 +564,13 @@ def test_load_train_config_peak_tflops(tmp_path):
         (GOOD_STAGES, "50e9", "peak_tflops: 0\n", "peak_tflops"),
         (GOOD_STAGES, "50e9", "snapshot_every_tokens: -1\n", "snapshot_every_tokens deve ser >= 0"),
         (GOOD_STAGES, "50e9", "keep_snapshots: 0\n", "keep_snapshots deve ser >= 1"),
+        (GOOD_STAGES, "50e9", "spike_threshold: 0\n", "spike_threshold deve ser > 0"),
+        (GOOD_STAGES, "50e9", "mtp_weight_end: -0.1\n", "mtp_weight_end deve ser >= 0"),
     ],
     ids=[
         "tokens_per_microbatch", "not_ascending", "seq_len_not_divisor", "last_below_total", "empty",
         "unknown_key", "fractional",
-        "peak_tflops_zero", "snapshot_negative", "keep_zero",
+        "peak_tflops_zero", "snapshot_negative", "keep_zero", "spike_threshold_zero", "mtp_weight_negative",
     ],
 )
 def test_load_train_config_rejects_invalid(tmp_path, stages, total, extra, match):

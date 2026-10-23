@@ -1,10 +1,13 @@
 """Loop de pré-treino retomável.
 
 Cada passo busca os `grad_accum` micro-batches antes do forward, conta os tokens válidos na CPU e
-faz o backward de `loss_mb * n_mb / n_passo`: o loss do passo é a média ponderada por token. Depois
-vêm o clip do grad norm, a guarda de passo não finito (zera os grads e não anda nenhum otimizador),
-o lr `initial_lr * wsd(step)` e o passo dos otimizadores. O estágio do currículo de contexto é o
-primeiro com `until_tokens > tokens_consumed`, avaliado no início de cada passo.
+faz o backward de `loss_mb * n_mb / n_passo`, com `loss_mb = lm_loss + λ(passo) * mtp_loss` (λ
+linear de `mtp_weight_start` a `mtp_weight_end`, R23): o loss do passo é a média ponderada por
+token. Depois vêm o clip do grad norm, a guarda de passo não finito (zera os grads e não anda
+nenhum otimizador), o lr `initial_lr * wsd(step)` e o passo dos otimizadores. O estágio do
+currículo de contexto é o primeiro com `until_tokens > tokens_consumed`, avaliado no início de
+cada passo. Depois do warmup, um loss acima de `(1 + spike_threshold)` × a EMA do loss marca
+`"spike": true` no metrics.jsonl e imprime um aviso.
 
 Checkpoints (R27): `last.pt` a cada `ckpt_every_tokens`, snapshots numerados a cada
 `snapshot_every_tokens` (os `keep_snapshots` mais novos ficam) e `last.pt` na fronteira do passo
@@ -32,7 +35,7 @@ from sore.train.checkpoint import load_checkpoint, save_checkpoint
 from sore.train.config import Stage, TrainConfig, resolve_data_paths
 from sore.train.data import PackedTokenStream
 from sore.train.optim import build_optimizers
-from sore.train.schedule import wsd_multiplier
+from sore.train.schedule import linear_schedule, wsd_multiplier
 
 
 @dataclass
@@ -41,6 +44,26 @@ class TrainSummary:
     tokens: int
     skipped_steps: int
     last_loss: float
+
+
+class LossSpikeDetector:
+    """EMA do loss do passo; `detector(loss)` diz se é spike (`loss > ema * (1 + threshold)`).
+
+    A 1a chamada só inicializa a EMA. Spikes e losses não finitos não a atualizam.
+    """
+
+    def __init__(self, threshold: float, beta: float = 0.98, ema: float | None = None) -> None:
+        self.threshold = threshold
+        self.beta = beta
+        self.ema = ema
+
+    def __call__(self, loss: float) -> bool:
+        if not math.isfinite(loss):
+            return False
+        if self.ema is not None and loss > self.ema * (1 + self.threshold):
+            return True
+        self.ema = loss if self.ema is None else self.beta * self.ema + (1 - self.beta) * loss
+        return False
 
 
 def resolve_device(device: str) -> torch.device:
@@ -102,8 +125,12 @@ def _autocast(device: torch.device):
     return contextlib.nullcontext()  # CPU: fp32
 
 
-def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float) -> dict:
-    """Um passo de otimização; devolve as métricas do passo (médias ponderadas por token)."""
+def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float, mtp_weight: float) -> dict:
+    """Um passo de otimização; devolve as métricas do passo (médias ponderadas por token).
+
+    O loss de cada micro-batch é `lm_loss + mtp_weight * mtp_loss`. O `out.loss` do modelo (que usa
+    o `mtp_weight` fixo do ModelConfig) é ignorado.
+    """
     batches = [next(stream) for _ in range(cfg.grad_accum)]
     n_valid = [int((b.labels != IGNORE_INDEX).sum()) for b in batches]
     n_step = sum(n_valid)
@@ -119,9 +146,12 @@ def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: fl
                 cu_seqlens=batch.cu_seqlens.to(device, non_blocking=True),
                 labels=batch.labels.to(device, non_blocking=True),
             )
-        (out.loss * weight).backward()
-        mtp = out.mtp_loss if out.mtp_loss is not None else torch.full_like(out.loss, math.nan)  # sem MTP -> null
-        sums += weight * torch.stack([t.detach() for t in (out.loss, out.lm_loss, mtp)])
+        if out.mtp_loss is None:
+            loss, mtp = out.lm_loss, torch.full_like(out.lm_loss, math.nan)  # sem MTP -> null
+        else:
+            loss, mtp = out.lm_loss + mtp_weight * out.mtp_loss, out.mtp_loss
+        (loss * weight).backward()
+        sums += weight * torch.stack([t.detach() for t in (loss, out.lm_loss, mtp)])
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     loss, lm_loss, mtp_loss, norm = torch.cat([sums, grad_norm.reshape(1).to(sums)]).tolist()  # 1 sync
@@ -218,10 +248,13 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     )
 
     step, skipped, last_loss = 0, 0, math.nan
+    spikes = LossSpikeDetector(cfg.spike_threshold)
     if resume is not None:
         data_state, train_state = load_checkpoint(resume, model, optimizers)
         stream.load_state_dict(data_state)
         step, skipped, last_loss = train_state["step"], train_state["skipped_steps"], train_state["last_loss"]
+        spikes.ema = train_state["loss_ema"]
+    mtp_start = model.cfg.mtp_weight if cfg.mtp_weight_start is None else cfg.mtp_weight_start
 
     def checkpoint(snapshot: bool = False) -> None:
         """`last.pt` e, com `snapshot`, também `snapshot_step{step}.pt` (o mesmo conteúdo).
@@ -233,6 +266,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
             "skipped_steps": skipped,
             "tokens": stream.tokens_consumed,
             "last_loss": last_loss,
+            "loss_ema": spikes.ema,
             "config": cfg.to_dict(),
         }
         paths = [out_dir / "last.pt"] + ([out_dir / f"snapshot_step{step:08d}.pt"] if snapshot else [])
@@ -257,7 +291,10 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                       f"micro_batch={stream.micro_batch}", flush=True)
             t0, tokens_before = time.perf_counter(), stream.tokens_consumed
             lr_mult = wsd_multiplier(step, cfg.warmup_steps, total_steps, cfg.decay_frac)
-            stats = _train_step(model, optimizers, stream, cfg, device, lr_mult)
+            mtp_weight = linear_schedule(step, total_steps, mtp_start, cfg.mtp_weight_end)
+            stats = _train_step(model, optimizers, stream, cfg, device, lr_mult, mtp_weight)
+            ema = spikes.ema  # antes deste passo, para o aviso
+            spike = step >= cfg.warmup_steps and spikes(stats["loss"])  # `step` ainda é o índice 0-based
             step, attempts = step + 1, attempts + 1
             skipped += stats["skipped"]
             last_loss = stats["loss"]
@@ -271,14 +308,19 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                 "tokens": stream.tokens_consumed,
                 **{k: _json_float(stats[k]) for k in ("loss", "lm_loss", "mtp_loss", "grad_norm")},
                 "lr_muon": lr,
+                "mtp_weight": mtp_weight,
                 "tok_s": tok_s,
                 "mfu": mfu,
                 "mem_gb": mem_gb,
                 "seq_len": stream.seq_len,
                 "skipped": stats["skipped"],
+                "spike": spike,
             }
             log.write(json.dumps(record) + "\n")
             log.flush()
+            if spike:
+                print(f"[spike] passo {step}: loss {stats['loss']:.4f} > {1 + cfg.spike_threshold:g} × EMA "
+                      f"{ema:.4f}", flush=True)
             if step % cfg.log_every == 0 or stats["skipped"]:
                 print(
                     f"step {step}/{total_steps} | loss {stats['loss']:.4f} (lm {stats['lm_loss']:.4f} "
