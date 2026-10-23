@@ -13,10 +13,10 @@
 ## Global Constraints
 
 - Todos os comandos rodam no WSL `Ubuntu-24.04` (usuário `wellington`), em `/mnt/c/Users/wellington.lara/Documents/GitHub/soreRNN`, com `export PATH=$HOME/.local/bin:$PATH UV_PROJECT_ENVIRONMENT=$HOME/.venvs/sorernn`. Testes rodam com `uv run pytest`.
-- `requires-python = ">=3.12,<3.13"`. Dependências de runtime: `torch`, `flash-linear-attention`, `numpy`, `pyyaml`. Dev: `pytest`. Nada além disso sem perguntar. As versões ficam travadas em `uv.lock` (Task 1).
+- `requires-python = ">=3.12,<3.13"`. Dependências de runtime: `torch`, `flash-linear-attention`, `numpy`, `pyyaml`. Dev: `pytest`. Nada além disso sem perguntar. As versões ficam travadas em `uv.lock` (Task 1). Versões verificadas no WSL com a 3050 em 2026-10-23: `torch==2.14.1` (wheel cu130), `triton==3.8.0`, `flash-linear-attention==0.5.2`.
 - A suíte passa em CPU sem Triton e sem FLA. Testes que precisam de GPU usam `@pytest.mark.cuda`; os que precisam de FLA usam `@pytest.mark.fla`. Ambos são pulados automaticamente quando o recurso não existe.
 - Tokens no disco são `uint32` little-endian. `ignore_index = -100` em todo lugar.
-- Layout empacotado: `input_ids` tem shape `[1, N]`. `cu_seqlens` é `int32` com shape `[S+1]`, começa em 0, termina em N, é estritamente crescente e não tem segmentos vazios.
+- Layout empacotado: `input_ids` tem shape `[1, N]`. `cu_seqlens` é `torch.long` (int64, padrão do FLA 0.5.2) com shape `[S+1]`, começa em 0, termina em N, é estritamente crescente e não tem segmentos vazios.
 - Identificadores em inglês; comentários e docs em português (padrão do repo).
 - Commits no formato `feat:`, `chore:`, `test:`, terminando com `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -34,7 +34,7 @@
 
 **Files:**
 - Move (`git mv`): `CMakeLists.txt include src tests examples scripts` → `legacy/cpp/`
-- Create: `pyproject.toml`, `sore/__init__.py`, `tests/conftest.py`, `tests/test_smoke.py`, `uv.lock`
+- Create: `pyproject.toml`, `sore/__init__.py`, `tests/conftest.py`, `tests/test_smoke.py`, `uv.lock`, `.gitattributes` (`* text=auto eol=lf` — o checkout é compartilhado entre Windows e WSL)
 - Modify: `README.md` (reescrita curta: stack v2, setup WSL, ponteiro para `legacy/cpp`), `.gitignore` (+ `.venv/ runs/ data/ *.pt`)
 
 **Interfaces:**
@@ -138,7 +138,7 @@ Detalhes que o implementador não deduz sozinho:
 - q, k e v passam pela conv e depois por `silu`. q e k são repetidos de `Hqk` para `Hv` heads com `repeat_interleave(Hv // Hqk, dim=2)`.
 - `g = -exp(A_log.float()) * softplus(a_proj(x).float() + dt_bias)`; `beta = sigmoid(b_proj(x))`; `scale = Dk ** -0.5`.
 - Backend `torch`: `F.normalize` em q e k, depois `naive_gated_delta_rule`.
-- Backend `fla`: `fla.ops.gated_delta_rule.chunk_gated_delta_rule(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True)`. Antes de implementar, confirmar a assinatura na versão travada (`inspect.signature`).
+- Backend `fla`: `fla.ops.gated_delta_rule.chunk_gated_delta_rule(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True)`. Assinatura confirmada no FLA 0.5.2: `(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False, use_beta_sigmoid_in_kernel=False, allow_neg_eigval=False, state_v_first=False, cu_seqlens=None, cu_seqlens_cpu=None, cp_context=None)` → `(o, final_state)`. Passar também `cu_seqlens_cpu` (cópia em CPU feita pelo loader) para evitar sync host↔device.
 - Saída: `o_proj((o_norm(o) * silu(g_proj(x))).flatten(-2))`.
 - Init: `A_log = log(U(1, 16))`; `dt_bias = softplus⁻¹(dt)`, com `dt` log-uniforme em `[1e-3, 1e-1]`.
 
@@ -251,8 +251,7 @@ Detalhes que o implementador não deduz sozinho:
 **Interfaces:**
 - Consumes: `SoreLM`.
 - Produces:
-  - `newton_schulz5(G: Tensor, steps: int = 5) -> Tensor`: coeficientes `(3.4445, -4.7750, 2.0315)`, calculado em bf16, normalizado por `G.norm() + 1e-7` e transposto quando há mais linhas que colunas.
-  - `Muon(params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.1)`: a atualização é `NS(momentum) * 0.2 * sqrt(max(rows, cols))` (escala Moonlight), com weight decay desacoplado.
+  - Muon: usar o nativo `torch.optim.Muon(params, lr=lr_muon, weight_decay=weight_decay, momentum=0.95, nesterov=True, ns_steps=5, adjust_lr_fn="match_rms_adamw")`. Esse `adjust_lr_fn` aplica a escala Moonlight, então o lr fica na mesma escala do AdamW. Confirmar com `inspect` que `"match_rms_adamw"` é aceito no torch 2.14.1; se não for, anotar o valor aceito no commit. Não implementar Newton-Schulz próprio.
   - `split_param_groups(model) -> tuple[list[nn.Parameter], list[nn.Parameter]]` devolve (muon, adamw):
     - Muon recebe parâmetros com `ndim == 2` dentro de `blocks`/`mtp` cujo nome não contém `conv`.
     - Todo o resto vai para AdamW (embedding, normas, `A_log`, `dt_bias`, conv, hyper-residual).
@@ -260,7 +259,7 @@ Detalhes que o implementador não deduz sozinho:
   - `wsd_multiplier(step: int, warmup: int, total: int, decay_frac: float) -> float`: warmup linear de 0 a 1, platô em 1 e decay `1 - sqrt(progresso)` até 0 no último `decay_frac`.
 
 - [ ] **Step 1:** Escrever os testes:
-  - `test_ns5_singular_values`: em `randn(64,32)`, os valores singulares do resultado ficam dentro de `[0.5, 1.3]`.
+  - `test_one_step_updates_all`: um passo de `build_optimizers` num SoreLM tiny altera todos os parâmetros que têm grad.
   - `test_split`: `embed.weight` no AdamW, `blocks.0.mixer.q_proj.weight` no Muon, `conv_q` no AdamW, e nenhum parâmetro repetido ou faltando.
   - `test_wsd_points`: `(0, 10, 100, 0.2) → 0.0`; `(10, ...) → 1.0`; `(50, ...) → 1.0`; `(100, ...) → 0.0`; `(90, ...) → 1 - sqrt(0.5)`.
 - [ ] **Step 2:** Rodar os testes. Esperado: FAIL.
@@ -277,7 +276,7 @@ Detalhes que o implementador não deduz sozinho:
 **Interfaces:**
 - Produces:
   - `write_token_shard(path: Path, tokens: np.ndarray) -> None`: grava `uint32` cru mais o sidecar `path.with_suffix(".json")` com `{"n_tokens": int, "dtype": "uint32"}`.
-  - `Batch` (dataclass): `input_ids: LongTensor[1,N]`, `labels: LongTensor[1,N]`, `cu_seqlens: IntTensor[S+1]`.
+  - `Batch` (dataclass): `input_ids: LongTensor[1,N]`, `labels: LongTensor[1,N]`, `cu_seqlens: LongTensor[S+1]`.
   - `PackedTokenStream(paths: list[Path], seq_len: int, micro_batch: int, eos_id: int, seed: int)` com:
     - `__iter__` / `__next__ -> Batch`
     - `set_shape(seq_len: int, micro_batch: int) -> None`
