@@ -13,7 +13,6 @@ import json
 import math
 import random
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,8 +62,18 @@ def _sync_stage(stream: PackedTokenStream, stages: list[Stage]) -> bool:
     return True
 
 
-def compile_model(model: torch.nn.Module) -> Callable:
-    """`torch.compile(model)` com o workaround do Inductor (usado pelo trainer e por `scripts/bench.py`).
+def compile_model(model: SoreLM) -> SoreLM:
+    """Compila cada Block in-place (`nn.Module.compile`) e devolve o próprio `model` (trainer e `scripts/bench.py`).
+
+    Ruling R25: compilar o modelo inteiro não adianta com grad checkpoint, porque o
+    `torch.utils.checkpoint` desliga o Dynamo e o tronco todo rodava eager. Compilando cada Block
+    do tronco e o do MTP, com o checkpoint por fora (`SoreLM.trunk`), só o kernel do FLA
+    (`torch.compiler.disable`) fica eager. Os nomes dos parâmetros não mudam, então a divisão
+    Muon/AdamW e o state_dict continuam os mesmos.
+
+    `dynamic=False` mantém N (tokens do micro-batch) estático, porque o lowering do flex no Inductor
+    falha com Q_LEN dinâmico. O nº de documentos (`len(cu_seqlens)`) é marcado dinâmico em
+    `SoreLM.trunk`, para não recompilar a cada micro-batch.
 
     torch 2.14.1: a fusão "mix order reduction" do Inductor quebra no 1º backward do SoreLM
     (InductorError: AssertionError "509 v.s. 510" em MixOrderReduction.get_numel_rnumel).
@@ -73,7 +82,10 @@ def compile_model(model: torch.nn.Module) -> Callable:
     import torch._inductor.config as inductor_config
 
     inductor_config.triton.mix_order_reduction = False
-    return torch.compile(model)
+    blocks = [*model.blocks, *([model.mtp.block] if model.mtp is not None else [])]
+    for block in blocks:
+        block.compile(dynamic=False)
+    return model
 
 
 def _autocast(device: torch.device):
@@ -82,7 +94,7 @@ def _autocast(device: torch.device):
     return contextlib.nullcontext()  # CPU: fp32
 
 
-def _train_step(fwd, model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float) -> dict:
+def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float) -> dict:
     """Um passo de otimização; devolve as métricas do passo (médias ponderadas por token)."""
     batches = [next(stream) for _ in range(cfg.grad_accum)]
     n_valid = [int((b.labels != IGNORE_INDEX).sum()) for b in batches]
@@ -94,7 +106,7 @@ def _train_step(fwd, model, optimizers, stream, cfg: TrainConfig, device, lr_mul
             continue
         weight = n / n_step
         with _autocast(device):
-            out = fwd(
+            out = model(
                 batch.input_ids.to(device, non_blocking=True),
                 cu_seqlens=batch.cu_seqlens.to(device, non_blocking=True),
                 labels=batch.labels.to(device, non_blocking=True),
@@ -132,9 +144,9 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     model = SoreLM(get_preset(cfg.model_preset, **cfg.model_overrides)).to(device)
-    # otimizadores sobre o módulo sem wrapper: a divisão Muon/AdamW depende dos nomes dos parâmetros
     optimizers = build_optimizers(model, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay)
-    fwd = compile_model(model) if cfg.compile else model
+    if cfg.compile:
+        compile_model(model)  # in-place, por Block: os nomes dos parâmetros não mudam
     first = cfg.stages[0]
     stream = PackedTokenStream(
         resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed
@@ -170,7 +182,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                       f"micro_batch={stream.micro_batch}", flush=True)
             t0, tokens_before = time.perf_counter(), stream.tokens_consumed
             lr_mult = wsd_multiplier(step, cfg.warmup_steps, total_steps, cfg.decay_frac)
-            stats = _train_step(fwd, model, optimizers, stream, cfg, device, lr_mult)
+            stats = _train_step(model, optimizers, stream, cfg, device, lr_mult)
             step, attempts = step + 1, attempts + 1
             skipped += stats["skipped"]
             last_loss = stats["loss"]

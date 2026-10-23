@@ -212,20 +212,25 @@ def test_metrics_include_mfu(tmp_path):
         assert m["mfu"] == pytest.approx(expected, rel=1e-12) and m["mfu"] > 0
 
 
-def test_compile_model_disables_mix_order_reduction(monkeypatch):
-    # helper compartilhado pelo trainer e pelo scripts/bench.py
+def test_compile_model_compiles_each_block_in_place(monkeypatch):
+    # helper compartilhado pelo trainer e pelo scripts/bench.py: Module.compile() em cada Block do
+    # tronco e no Block do MTP (N estático), com mix_order_reduction já desligado; sem wrapper
     import torch._inductor.config as inductor_config
 
     monkeypatch.setattr(inductor_config.triton, "mix_order_reduction", True)  # restaurado ao fim
     seen = []
 
-    def fake_compile(model):
-        seen.append(inductor_config.triton.mix_order_reduction)
-        return "compiled"
+    def fake_compile(fn, *args, **kwargs):
+        seen.append((fn.__self__, kwargs.get("dynamic"), inductor_config.triton.mix_order_reduction))
+        return fn
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    assert compile_model(torch.nn.Linear(2, 2)) == "compiled"
-    assert seen == [False]
+    model = lm_module.SoreLM(get_preset("tiny", **CPU_BACKENDS))
+    names = [n for n, _ in model.named_parameters()]
+    assert compile_model(model) is model
+    assert [m for m, *_ in seen] == [*model.blocks, model.mtp.block]
+    assert all(dynamic is False and mix is False for _, dynamic, mix in seen)
+    assert [n for n, _ in model.named_parameters()] == names  # divisão Muon/AdamW intacta
 
 
 def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
@@ -236,15 +241,59 @@ def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
     monkeypatch.setattr(inductor_config.triton, "mix_order_reduction", True)  # restaurado ao fim
     compiled = []
 
-    def fake_compile(model, *args, **kwargs):
+    def fake_compile(fn, *args, **kwargs):
         compiled.append(inductor_config.triton.mix_order_reduction)
-        return model
+        return fn
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     shard = _shard(tmp_path / "s.bin", 1000)
     cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, compile=True)
     assert train(cfg, max_steps=1).steps == 1
-    assert compiled == [False]  # flag já desligada quando torch.compile é chamado
+    n_blocks = get_preset("tiny").n_layers + 1  # tronco + MTP
+    assert compiled == [False] * n_blocks  # flag já desligada quando torch.compile é chamado
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_compile_model_matches_eager_with_grad_checkpoint():
+    # R25: com grad checkpoint, compilar o modelo inteiro deixava o tronco eager (o checkpoint
+    # desliga o Dynamo). Por bloco, loss e gradientes batem com o eager (fp32) e o S (nº de
+    # documentos) varia sem quebrar o recompute do checkpoint.
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    try:
+        cfg = get_preset("tiny", gdn_backend="fla", attn_backend="flex", grad_checkpoint=True)
+        torch.manual_seed(0)
+        eager = lm_module.SoreLM(cfg).cuda()
+        compiled = lm_module.SoreLM(cfg).cuda()
+        compiled.load_state_dict(eager.state_dict())
+        assert compile_model(compiled) is compiled
+        assert all(b._compiled_call_impl is not None for b in [*compiled.blocks, compiled.mtp.block])
+        frames_before = counters["frames"]["ok"]
+
+        gen = torch.Generator().manual_seed(1)
+        graphs = []  # grafos compilados após cada iteração
+        for cu in ([0, 5, 140, 300], [0, 60, 300], [0, 1, 2, 100, 300], [0, 300]):  # S = 3, 2, 4, 1
+            ids = torch.randint(1, 512, (1, 300), generator=gen).cuda()
+            cu_seqlens = torch.tensor(cu, device="cuda")
+            results = []
+            for model in (eager, compiled):
+                model.zero_grad(set_to_none=True)
+                out = model(ids, cu_seqlens=cu_seqlens, labels=ids)
+                out.loss.backward()
+                results.append((out.loss.detach(), {n: p.grad for n, p in model.named_parameters()}))
+            (loss_ref, grads_ref), (loss, grads) = results
+            torch.testing.assert_close(loss, loss_ref, rtol=1e-5, atol=0)
+            for name, g_ref in grads_ref.items():
+                diff = (grads[name] - g_ref).abs().max().item()
+                assert diff <= 2e-3 * g_ref.abs().max().item(), (cu, name, diff)
+            graphs.append(counters["stats"]["unique_graphs"])
+        assert counters["frames"]["ok"] > frames_before  # o Dynamo compilou de fato
+        # S dinâmico desde o 1º compile: S = 2 e 4 reusam os grafos (S = 1 especializa à parte)
+        assert graphs[1] == graphs[2] == graphs[0], graphs
+    finally:
+        torch._dynamo.reset()
 
 
 # --- config -----------------------------------------------------------------------------------

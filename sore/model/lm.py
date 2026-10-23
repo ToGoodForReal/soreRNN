@@ -104,6 +104,10 @@ class SoreLM(nn.Module):
     def trunk(self, x: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
         """Embeddings `[B,T,D]` -> hidden final `[B,T,D]` (blocos, `StreamFinal` e norma final)."""
         H = init_stream(x, self.cfg)
+        if cu_seqlens is not None:
+            # O nº de documentos varia a cada micro-batch. Com o compile por Block (`compile_model`,
+            # N estático) essa dimensão já entra dinâmica e não recompila a cada S. Em eager não faz nada.
+            torch._dynamo.maybe_mark_dynamic(cu_seqlens, 0)
         use_checkpoint = self.cfg.grad_checkpoint and torch.is_grad_enabled()
         for block in self.blocks:
             if use_checkpoint:

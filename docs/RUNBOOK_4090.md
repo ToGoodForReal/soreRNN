@@ -41,7 +41,7 @@ uv run python scripts/bench.py --preset b0_8 --seq-len 8192 --micro-batch 1 --gr
 
 - `--grad-accum 2` é necessário: com 1 os gradientes são liberados a cada passo e o pico fica
   subestimado. No treino o 2º micro-batch roda com os gradientes acumulados vivos. Na 3050 o pico
-  do s150m subiu de 2,43 para 3,00 GB.
+  do s150m sobe ~0,6 GB (os gradientes fp32) de `--grad-accum 1` para 2.
 - **Critério:** sem OOM e `VRAM pico` (alocado) **≤ 22 GB** nos dois. O `reservado` também tem de
   deixar folga para os 24GB. GB aqui é 10⁹ bytes, igual ao `mem_gb` do `metrics.jsonl`.
 - **Se não couber:** baixar `micro_batch` e subir `grad_accum`, mantendo os tokens por passo
@@ -81,8 +81,11 @@ uv run python -m sore.train --config configs/b0_8_pretrain.yaml 2>&1 | tee -a ru
 # Ctrl-b d para destacar; `tmux attach -t pretrain` para voltar
 ```
 
-O 1º passo é lento porque é nele que o `torch.compile` compila. A troca para 8K recompila. O
-`tok_s`/`mfu` desses passos é ruído.
+O 1º passo é lento porque é nele que o `torch.compile` compila cada Block. A troca para 8K **não**
+recompila: N = `seq_len × micro_batch` = 8192 nos dois estágios e o nº de documentos do micro-batch
+já entra dinâmico. A única variante extra é a de um micro-batch com um documento só
+(`cu_seqlens = [0, N]`, comum no estágio 8192 × 1), compilada uma vez quando aparece pela 1ª vez.
+O `tok_s`/`mfu` desses passos é ruído.
 
 Opcional, numa segunda janela do tmux: o trainer guarda só um `last.pt` (troca atômica). Uma
 cópia periódica permite voltar atrás em caso de divergência. Cada cópia tem ~6–7 GB, então apague
@@ -160,21 +163,31 @@ toda vez que um passo é pulado) e `nvidia-smi dmon -s pucm` (potência, clocks 
   65.536, o que dá ≈ 2–3 GB transitórios por chunk (LM e MTP). Se o estágio de 8K der OOM, baixe o
   padrão em `sore/model/loss.py` (ex.: 2048) e repita o portão.
 - **`eos_id` e `data_paths` dos configs são placeholders** até o plano de tokenizer e dados.
-- **Graph break do Dynamo em `chunked_lm_loss`.** O `int((labels != -100).sum())` gera um aviso no
-  1º passo compilado e uma sincronização por forward. É inofensivo.
+- **Compile por Block e graph breaks.** O `chunk_gated_delta_rule` do FLA é
+  `torch.compiler.disable`. O custo real vinha do grad checkpoint: o `torch.utils.checkpoint`
+  desliga o Dynamo, então com `torch.compile(model)` o tronco inteiro rodava eager. Por isso o
+  `compile_model` compila cada Block in-place (tronco e MTP) e deixa o checkpoint por fora. Sobra
+  um graph break inofensivo por bloco GDN, em volta do kernel do FLA. Embedding, norma final e a
+  loss em chunks rodam eager. O `int((labels != -100).sum())` de `chunked_lm_loss` continua
+  fazendo uma sincronização GPU→CPU por loss (LM e MTP) a cada forward.
+- **N estático no compile.** O `compile_model` usa `dynamic=False`, porque o lowering do flex no
+  Inductor falha com Q_LEN dinâmico (`CantSplit`). Só o nº de documentos (`len(cu_seqlens)`) é
+  dinâmico (`SoreLM.trunk`). N muda só entre processos, nunca dentro de um treino: o `TrainConfig`
+  exige `seq_len × micro_batch` igual em todos os estágios.
 
 ## 7. Referência: benchmark na RTX 3050 Laptop 6GB (WSL2)
 
 Configuração: `s150m` (164,3M parâmetros, 1,35 GFLOP/token a 2048), FLA + flex, seq 2048 ×
-micro_batch 1, `--grad-checkpoint`, `--peak-tflops 35`, 10 passos com 2 de warmup e mediana dos
-outros 8. O comando base é
-`uv run python scripts/bench.py --preset s150m --seq-len 2048 --micro-batch 1 --steps 10 --grad-checkpoint --peak-tflops 35`.
+micro_batch 1, `--grad-accum 2`, `--grad-checkpoint`, `--peak-tflops 35`, 10 passos com 2 de
+warmup e mediana dos outros 8. O comando base é
+`uv run python scripts/bench.py --preset s150m --seq-len 2048 --micro-batch 1 --grad-accum 2 --steps 10 --grad-checkpoint --peak-tflops 35`.
 
 | Variante | tok/s | MFU | VRAM pico (alocado / reservado) | 1º passo |
 |---|---:|---:|---:|---:|
-| eager (comando base) | 1.374 | 5,3% | 3,60 / 4,66 GB | 70 s |
-| `--compile` | 1.893 | 7,3% | 2,43 / 2,85 GB | 85 s |
-| `--compile --grad-accum 8` (6 passos) | 2.346 | 9,0% | 3,00 / 3,42 GB | 55 s (cache do Inductor quente) |
+| eager (comando base) | 1.240 | 4,8% | 4,24 / 5,20 GB | 53 s |
+| `--compile` (por Block) | 2.300 | 8,8% | 4,24 / 4,56 GB | 66 s |
+
+A GPU de notebook esquenta e o throughput oscila ~10–15% entre execuções.
 
 No modo eager, com `--grad-accum 1`, cada passo de 2048 tokens gasta ~0,33 s no forward, ~0,87 s
 no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~22% do

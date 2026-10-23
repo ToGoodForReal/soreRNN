@@ -49,13 +49,11 @@ def synthetic_batch(
     return ids, labels, cu_seqlens
 
 
-def train_step(
-    fwd, model: SoreLM, optimizers: list[torch.optim.Optimizer], batches: list[tuple[Tensor, ...]]
-) -> None:
+def train_step(model: SoreLM, optimizers: list[torch.optim.Optimizer], batches: list[tuple[Tensor, ...]]) -> None:
     """Um passo do trainer: backward de cada micro-batch (loss / n), clip em 1.0 e passo dos otimizadores."""
     for ids, labels, cu_seqlens in batches:
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = fwd(ids, cu_seqlens=cu_seqlens, labels=labels)
+            out = model(ids, cu_seqlens=cu_seqlens, labels=labels)
         (out.loss / len(batches)).backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     for opt in optimizers:
@@ -73,7 +71,7 @@ def main() -> None:
         "--grad-accum", type=int, default=1, help="micro-batches por passo do otimizador (o trainer usa 16-64)"
     )
     parser.add_argument("--warmup", type=int, default=2, help="passos iniciais fora da mediana")
-    parser.add_argument("--compile", action="store_true", help="torch.compile no modelo (como o trainer)")
+    parser.add_argument("--compile", action="store_true", help="torch.compile por Block (compile_model, como o trainer)")
     parser.add_argument("--grad-checkpoint", action="store_true", help="activation checkpointing por bloco")
     parser.add_argument("--peak-tflops", type=float, default=165.0, help="pico BF16 denso da GPU (4090: 165)")
     parser.add_argument("--json", action="store_true", help="imprime também o resultado em JSON")
@@ -90,7 +88,8 @@ def main() -> None:
     cfg = get_preset(args.preset, grad_checkpoint=args.grad_checkpoint)
     model = SoreLM(cfg).to(device)
     optimizers = build_optimizers(model, lr_muon=0.02, lr_adamw=3e-3, weight_decay=0.1)
-    fwd = compile_model(model) if args.compile else model
+    if args.compile:
+        compile_model(model)  # in-place, por Block
     flops = flops_per_token(cfg, args.seq_len)
     tokens = args.seq_len * args.micro_batch * args.grad_accum  # por passo
     print(
@@ -109,7 +108,7 @@ def main() -> None:
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         try:
-            train_step(fwd, model, optimizers, batches)
+            train_step(model, optimizers, batches)
             torch.cuda.synchronize(device)
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
