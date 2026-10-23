@@ -308,11 +308,11 @@ def test_resume_applies_config_lr_and_weight_decay(tmp_path, capsys):
 
 
 def test_mtp_weight_can_change_on_resume(tmp_path):
-    # mtp_weight é campo de execução: não muda os pesos, então a retomada aceita outro valor
+    # mtp_weight e loss_chunk_size são campos de execução: não mudam os pesos, então a retomada aceita outros valores
     shard = _shard(tmp_path / "s.bin", 1000)
     cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
     train(cfg, max_steps=1)
-    changed = dataclasses.replace(cfg, model_overrides={**CPU_BACKENDS, "mtp_weight": 0.5})
+    changed = dataclasses.replace(cfg, model_overrides={**CPU_BACKENDS, "mtp_weight": 0.5, "loss_chunk_size": 16})
     assert train(changed, resume=Path(cfg.out_dir) / "last.pt", max_steps=1).steps == 2
 
 

@@ -58,9 +58,6 @@ class GatedDeltaNet(nn.Module):
         log_dt = torch.rand(self.v_heads) * (math.log(_DT_MAX) - math.log(_DT_MIN)) + math.log(_DT_MIN)
         dt = log_dt.exp()
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
-        # marcação para o otimizador poder tirar o weight decay desses escalares
-        self.A_log._no_weight_decay = True
-        self.dt_bias._no_weight_decay = True
 
         self.o_norm = RMSNorm(self.head_dim, eps=cfg.norm_eps)
         self.o_proj = nn.Linear(v_dim, d, bias=False)

@@ -23,6 +23,8 @@ def test_invalid_head_ratios_raise():
         ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, gdn_qk_heads=4, gdn_v_heads=6)
     with pytest.raises(ValueError):
         ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, attn_heads=6, attn_kv_heads=4)
+    with pytest.raises(ValueError, match="loss_chunk_size"):
+        ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, loss_chunk_size=0)
 
 
 def test_roundtrip():

@@ -47,6 +47,7 @@ class ModelConfig:
     gdn_backend: Literal["fla", "torch"] = "fla"
     attn_backend: Literal["sdpa", "flex"] = "sdpa"
     grad_checkpoint: bool = False
+    loss_chunk_size: int = 8192
 
     def __post_init__(self) -> None:
         # YAML/JSON devolvem lista; normaliza para tupla (hashable e comparável)
@@ -65,6 +66,8 @@ class ModelConfig:
             raise ValueError(
                 f"attn_heads={self.attn_heads} deve ser múltiplo de attn_kv_heads={self.attn_kv_heads}"
             )
+        if self.loss_chunk_size <= 0:
+            raise ValueError(f"loss_chunk_size deve ser positivo; recebi {self.loss_chunk_size}")
 
     def layer_types(self) -> list[str]:
         """Tipo de cada camada (`"gdn"` ou `"attn"`), repetindo `layer_pattern`."""

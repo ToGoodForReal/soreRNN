@@ -49,5 +49,6 @@ class MTPModule(nn.Module):
         self.final_norm = RMSNorm(d, eps=cfg.norm_eps)
 
     def forward(self, h: Tensor, emb_next: Tensor, cu_seqlens: Tensor | None = None, block_mask=None) -> Tensor:
-        x = self.proj(torch.cat([self.norm_h(h), self.norm_e(emb_next)], dim=-1))
+        # proj roda em bf16 sob autocast; .float() mantém o stream residual do MTP em fp32, como o do tronco
+        x = self.proj(torch.cat([self.norm_h(h), self.norm_e(emb_next)], dim=-1)).float()
         return self.final_norm(self.block(x, cu_seqlens, block_mask))

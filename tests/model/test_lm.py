@@ -236,6 +236,66 @@ def test_flex_block_mask_built_once_per_forward(monkeypatch):
         torch.testing.assert_close(model.logits(ids, cu), ref.logits(ids, cu), atol=2e-3, rtol=0)
 
 
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_packed_isolation_bf16_fla_flex():
+    # ponta a ponta no caminho de treino (FLA + flex, autocast bf16): documentos empacotados ==
+    # documentos sozinhos. Os de 1 e 69 tokens caem no sdpa (T < 128); o empacotado usa o flex.
+    model = _model(gdn_backend="fla", attn_backend="flex").cuda()
+    cu_list = [0, 1, 70, 200, 333]
+    ids, cu = _tokens(333, seed=1).cuda(), _cu(cu_list).cuda()
+
+    def logits(x, cu_seqlens=None):
+        # tronco em bf16 e projeção em fp32: compara o tronco, não o arredondamento bf16 dos logits
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            h = model.trunk(model.embed(x), cu_seqlens)
+        return torch.nn.functional.linear(h.float(), model.head_weight)
+
+    with torch.no_grad():
+        packed = logits(ids, cu)
+        separate = torch.cat([logits(ids[:, a:b]) for a, b in zip(cu_list[:-1], cu_list[1:])], dim=1)
+        leaky = logits(ids)  # controle sem cu_seqlens: os documentos seguintes enxergam os anteriores
+    torch.testing.assert_close(packed, separate, atol=2e-2, rtol=0)
+    assert (leaky[:, 70:] - separate[:, 70:]).abs().max() > 0.2
+
+    labels = _tokens(333, seed=2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = model(ids, cu, labels=labels)
+    out.loss.backward()
+    bad = [n for n, p in model.named_parameters() if p.grad is None or not torch.isfinite(p.grad).all()]
+    assert not bad, bad
+
+
+def test_mtp_stream_is_fp32_under_autocast():
+    # o stream residual do MTP é fp32 como o do tronco: a saída bf16 do `proj` (autocast) é convertida
+    model = _model()
+    seen = []
+    model.mtp.block.register_forward_pre_hook(lambda mod, args: seen.append(args[0].dtype))
+    model.blocks[0].register_forward_pre_hook(lambda mod, args: seen.append(args[0].dtype))
+    ids, cu = _tokens(30, seed=1), _cu(CU)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        model(ids, cu, labels=_labels())
+    assert seen == [torch.float32, torch.float32]  # bloco 0 do tronco, depois o Block do MTP
+
+
+def test_loss_chunk_size_from_config(monkeypatch):
+    calls = []
+    real = lm_module.chunked_lm_loss
+
+    def recording(hidden, weight, labels, chunk_size=8192, **kwargs):
+        calls.append(chunk_size)
+        return real(hidden, weight, labels, chunk_size=chunk_size, **kwargs)
+
+    ids, cu, labels = _tokens(30, seed=1), _cu(CU), _labels()
+    with torch.no_grad():
+        ref = _model()(ids, cu, labels=labels)
+        monkeypatch.setattr(lm_module, "chunked_lm_loss", recording)
+        out = _model(loss_chunk_size=7)(ids, cu, labels=labels)
+    assert calls == [7, 7]  # loss do LM e do MTP
+    torch.testing.assert_close(out.lm_loss, ref.lm_loss, atol=1e-6, rtol=0)
+    torch.testing.assert_close(out.mtp_loss, ref.mtp_loss, atol=1e-6, rtol=0)
+
+
 def test_forward_variants():
     model = _model()
     ids, cu, labels = _tokens(30, seed=1), _cu(CU), _labels()

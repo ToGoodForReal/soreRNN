@@ -149,14 +149,15 @@ class SoreLM(nn.Module):
             return LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)
 
         weight = self.head_weight
-        lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), ce=self.chunk_ce)
+        chunk = self.cfg.loss_chunk_size
+        lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), chunk, ce=self.chunk_ce)
         lm_loss = lm_sum / max(n_tokens, 1)
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
             h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask)
             targets = mtp_labels(labels, cu_seqlens)
-            mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), ce=self.chunk_ce)
+            mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), chunk, ce=self.chunk_ce)
             mtp_loss = mtp_sum / max(n_mtp, 1)
             loss = lm_loss + self.cfg.mtp_weight * mtp_loss
         return LMOutput(loss=loss, lm_loss=lm_loss, mtp_loss=mtp_loss, n_tokens=n_tokens)

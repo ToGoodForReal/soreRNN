@@ -16,7 +16,7 @@ from sore.model import SoreLM
 
 # Campos de execução do ModelConfig: podem mudar entre o save e a retomada sem mudar os pesos.
 # `mtp_weight` entra aqui porque o trainer usa o λ do TrainConfig (R23), não o do modelo.
-_EXECUTION_FIELDS = ("gdn_backend", "attn_backend", "grad_checkpoint", "mtp_weight")
+_EXECUTION_FIELDS = ("gdn_backend", "attn_backend", "grad_checkpoint", "mtp_weight", "loss_chunk_size")
 
 
 def _rng_state() -> dict:

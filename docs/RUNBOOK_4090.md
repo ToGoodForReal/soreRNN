@@ -55,8 +55,8 @@ uv run python scripts/bench.py --preset b0_8 --seq-len 8192 --micro-batch 1 --gr
   deixar folga para os 24GB. GB aqui é 10⁹ bytes, igual ao `mem_gb` do `metrics.jsonl`.
 - **Se não couber:** baixar `micro_batch` e subir `grad_accum`, mantendo os tokens por passo
   (524.288). O `TrainConfig` exige `seq_len × micro_batch` igual em todos os estágios e o estágio de
-  8K já usa `micro_batch` 1. Por isso o primeiro recurso é reduzir o `chunk_size` da loss (seção 6).
-  Repita o portão depois de qualquer mudança.
+  8K já usa `micro_batch` 1. Por isso o primeiro recurso é reduzir `loss_chunk_size` em
+  `model_overrides` (seção 6). Repita o portão depois de qualquer mudança.
 
 ### 2.2 Throughput e prazo
 
@@ -192,9 +192,11 @@ treino quem manda é o λ do `TrainConfig`.
 - **Crash sem sinal perde até `ckpt_every_tokens` de trabalho.** Queda de energia, OOM ou
   `kill -9` não passam pelo handler de SIGINT/SIGTERM. No `b0_8` isso é até 5e7 tokens, ~95
   passos, ~70 min a 12K tok/s.
-- **Memória transitória da loss.** O `chunked_lm_loss` usa por padrão `chunk_size` 8192 × vocab
-  65.536, o que dá ≈ 2–3 GB transitórios por chunk (LM e MTP). Se o estágio de 8K der OOM, baixe o
-  padrão em `sore/model/loss.py` (ex.: 2048) e repita o portão.
+- **Memória transitória da loss.** O `chunked_lm_loss` usa `loss_chunk_size` (padrão 8192 no
+  `ModelConfig`) × vocab 65.536, o que dá ≈ 2–3 GB transitórios por chunk (LM e MTP) em modo eager
+  (com `--compile`, o `ChunkCrossEntropy` funde o chunk). Se o estágio de 8K der OOM, baixe
+  `loss_chunk_size` em `model_overrides` do YAML (ex.: `loss_chunk_size: 2048`; é campo de execução,
+  aceito também em `--resume`) e repita o portão.
 - **`eos_id` e `data_paths` dos configs são placeholders** até o plano de tokenizer e dados.
 - **Compile por Block e graph breaks.** O `chunk_gated_delta_rule` do FLA é
   `torch.compiler.disable`. O custo real vinha do grad checkpoint: o `torch.utils.checkpoint`
