@@ -15,22 +15,24 @@ Operação do pré-treino de ~6–7 semanas do preset `b0_8` numa RTX 4090 24GB 
 
 ## 1. Setup
 
-No checkout do repositório:
+Requer Python 3.12 e driver NVIDIA com suporte a CUDA ≥ 13.0 (≥ 580 no Linux; os wheels `torch 2.14.1`
+do `uv.lock` são `cu130`). No checkout do repositório:
 
 ```bash
 uv sync                      # torch 2.14.1 (cu130), triton 3.8.0, flash-linear-attention 0.5.2 (uv.lock)
-nvidia-smi                   # driver ok, 24GB livres, nenhum outro processo na GPU
+nvidia-smi                   # driver com CUDA >= 13.0, 24GB livres, nenhum outro processo na GPU
 uv run python -c "import torch, fla; print(torch.__version__, torch.cuda.get_device_name())"
 uv run pytest -q             # tudo passa; os testes @cuda/@fla têm de rodar, não ser pulados
 ```
 
 Antes de lançar, edite `configs/b0_8_pretrain.yaml`:
 - `data_paths` e `eos_id` reais (hoje são placeholders, ver seção 6). Os shards são `uint32` com o
-  sidecar `.json` ao lado. O stream corta cada shard em unidades de 8192 tokens (o maior `seq_len`
-  dos estágios) e sorteia as unidades por época. No estágio de 4K cada unidade vira 2 janelas
-  seguidas. A troca para 8K continua a mesma época a partir da próxima unidade inteira, sem
-  reamostrar o que já foi visto. Um shard com menos de 8193 tokens não entra, e até 8192 tokens do
-  fim de cada shard ficam de fora. Prefira shards grandes.
+  sidecar `.json` ao lado. O stream corta cada shard em unidades fixas de `unit_len` = 8192 tokens
+  (o maior `seq_len` dos estágios; todo `seq_len` precisa dividir `unit_len`) e sorteia as unidades
+  por época. No estágio de 4K cada unidade vira 2 janelas seguidas. A troca para 8K continua a mesma
+  época a partir da próxima unidade inteira, sem reamostrar o que já foi visto. Um shard com menos
+  de `unit_len + 1` (8193) tokens não entra, e até `unit_len` tokens do fim de cada shard ficam de
+  fora. Prefira shards grandes.
 - `peak_tflops` fica no padrão 165 (pico BF16 denso da 4090) e só serve para o `mfu` do log.
 - `lr_muon` e `lr_adamw` (3e-3, padrão do `TrainConfig`) ainda não foram validados. Com o
   `match_rms_adamw` o lr do Muon tem a escala do AdamW, e o 0,02 da literatura vale para outra
@@ -221,13 +223,15 @@ warmup e mediana dos outros 8. O comando base é
 
 | Variante | tok/s | MFU | VRAM pico (alocado / reservado) | 1º passo |
 |---|---:|---:|---:|---:|
-| eager (comando base) | 1.240 | 4,8% | 4,24 / 5,20 GB | 53 s |
-| `--compile` (Blocks + CE da loss) | 2.959–3.227 | 11,4–12,4% | 3,00 / 3,28 GB | ~65 s a frio, ~10 s com o cache do Inductor |
+| eager (comando base) | 1.854 | 7,1% | 4,24 / 5,21 GB | 44 s |
+| `--compile` (Blocks + CE da loss) | 2.767–3.227 | 10,6–12,4% | 3,00 / 3,26–3,34 GB | ~65–85 s a frio, ~9 s com o cache do Inductor |
 
-Para comparação, nas mesmas condições: o antigo `torch.compile(model)` fazia 2.335 tok/s com
-3,00 GB, e só os Blocks compilados (CE da loss eager) faziam 2.384–2.703 tok/s com 4,24 GB. A GPU
-de notebook esquenta e o throughput oscila ~10–15% entre execuções.
+Para comparação, nas mesmas condições: antes de montar o `BlockMask` do flex uma vez por forward
+(R24), o modo eager fazia 1.240 tok/s (4,8% MFU, 1º passo em 53 s). No modo compilado, o antigo
+`torch.compile(model)` fazia 2.335 tok/s com 3,00 GB, e só os Blocks compilados (CE da loss eager)
+faziam 2.384–2.703 tok/s com 4,24 GB. A GPU de notebook esquenta e o throughput oscila ~10–15% entre
+execuções.
 
 No modo eager, com `--grad-accum 1`, cada passo de 2048 tokens gasta ~0,33 s no forward, ~0,87 s
-no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~22% do
+no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~20% do
 passo sem acúmulo.
