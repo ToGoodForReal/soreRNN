@@ -63,13 +63,15 @@ def _sync_stage(stream: PackedTokenStream, stages: list[Stage]) -> bool:
 
 
 def compile_model(model: SoreLM) -> SoreLM:
-    """Compila cada Block in-place (`nn.Module.compile`) e devolve o próprio `model` (trainer e `scripts/bench.py`).
+    """Compila cada Block e a CE da loss in-place (`nn.Module.compile`) e devolve o próprio `model`.
 
-    Ruling R25: compilar o modelo inteiro não adianta com grad checkpoint, porque o
-    `torch.utils.checkpoint` desliga o Dynamo e o tronco todo rodava eager. Compilando cada Block
-    do tronco e o do MTP, com o checkpoint por fora (`SoreLM.trunk`), só o kernel do FLA
-    (`torch.compiler.disable`) fica eager. Os nomes dos parâmetros não mudam, então a divisão
-    Muon/AdamW e o state_dict continuam os mesmos.
+    Usado pelo trainer e pelo `scripts/bench.py`. Ruling R25: compilar o modelo inteiro não adianta
+    com grad checkpoint, porque o `torch.utils.checkpoint` desliga o Dynamo e o tronco todo rodava
+    eager. Compilando cada Block do tronco e o do MTP, com o checkpoint por fora (`SoreLM.trunk`),
+    só o kernel do FLA (`torch.compiler.disable`) fica eager. A `chunk_ce` (CE de cada chunk da
+    loss, também sob checkpoint) é compilada junto: eager, ela materializa logits fp32 e log-probs
+    `chunk x V` no backward (+1,2 GB no s150m a 2048). Os nomes dos parâmetros não mudam, então a
+    divisão Muon/AdamW e o state_dict continuam os mesmos.
 
     `dynamic=False` mantém N (tokens do micro-batch) estático, porque o lowering do flex no Inductor
     falha com Q_LEN dinâmico. O nº de documentos (`len(cu_seqlens)`) é marcado dinâmico em
@@ -82,9 +84,9 @@ def compile_model(model: SoreLM) -> SoreLM:
     import torch._inductor.config as inductor_config
 
     inductor_config.triton.mix_order_reduction = False
-    blocks = [*model.blocks, *([model.mtp.block] if model.mtp is not None else [])]
-    for block in blocks:
-        block.compile(dynamic=False)
+    modules = [*model.blocks, *([model.mtp.block] if model.mtp is not None else []), model.chunk_ce]
+    for module in modules:
+        module.compile(dynamic=False)
     return model
 
 

@@ -214,7 +214,8 @@ def test_metrics_include_mfu(tmp_path):
 
 def test_compile_model_compiles_each_block_in_place(monkeypatch):
     # helper compartilhado pelo trainer e pelo scripts/bench.py: Module.compile() em cada Block do
-    # tronco e no Block do MTP (N estático), com mix_order_reduction já desligado; sem wrapper
+    # tronco, no Block do MTP e na cross-entropy dos chunks da loss (N estático), com
+    # mix_order_reduction já desligado; sem wrapper
     import torch._inductor.config as inductor_config
 
     monkeypatch.setattr(inductor_config.triton, "mix_order_reduction", True)  # restaurado ao fim
@@ -228,7 +229,7 @@ def test_compile_model_compiles_each_block_in_place(monkeypatch):
     model = lm_module.SoreLM(get_preset("tiny", **CPU_BACKENDS))
     names = [n for n, _ in model.named_parameters()]
     assert compile_model(model) is model
-    assert [m for m, *_ in seen] == [*model.blocks, model.mtp.block]
+    assert [m for m, *_ in seen] == [*model.blocks, model.mtp.block, model.chunk_ce]
     assert all(dynamic is False and mix is False for _, dynamic, mix in seen)
     assert [n for n, _ in model.named_parameters()] == names  # divisão Muon/AdamW intacta
 
@@ -249,8 +250,8 @@ def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
     shard = _shard(tmp_path / "s.bin", 1000)
     cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10, compile=True)
     assert train(cfg, max_steps=1).steps == 1
-    n_blocks = get_preset("tiny").n_layers + 1  # tronco + MTP
-    assert compiled == [False] * n_blocks  # flag já desligada quando torch.compile é chamado
+    n_modules = get_preset("tiny").n_layers + 2  # Blocks do tronco + Block do MTP + cross-entropy da loss
+    assert compiled == [False] * n_modules  # flag já desligada quando torch.compile é chamado
 
 
 @pytest.mark.cuda
@@ -269,7 +270,8 @@ def test_compile_model_matches_eager_with_grad_checkpoint():
         compiled = lm_module.SoreLM(cfg).cuda()
         compiled.load_state_dict(eager.state_dict())
         assert compile_model(compiled) is compiled
-        assert all(b._compiled_call_impl is not None for b in [*compiled.blocks, compiled.mtp.block])
+        targets = [*compiled.blocks, compiled.mtp.block, compiled.chunk_ce]
+        assert all(m._compiled_call_impl is not None for m in targets)
         frames_before = counters["frames"]["ok"]
 
         gen = torch.Generator().manual_seed(1)

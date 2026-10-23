@@ -2,7 +2,7 @@
 import torch
 import torch.nn.functional as F
 
-from sore.model.loss import chunked_lm_loss
+from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss
 
 N, D, V = 50, 16, 37
 
@@ -30,6 +30,21 @@ def test_chunked_matches_full():
     torch.testing.assert_close(grad_h, ref_h, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(grad_w, ref_w, rtol=1e-5, atol=1e-7)
     assert not grad_h[::5].any()  # linhas ignoradas não recebem gradiente
+
+
+def test_chunked_uses_given_ce_module():
+    # o SoreLM passa o próprio ChunkCrossEntropy (o compile_model o compila in-place)
+    class Recording(ChunkCrossEntropy):
+        def forward(self, hidden, weight, labels):
+            rows.append(hidden.shape[0])
+            return super().forward(hidden, weight, labels)
+
+    rows = []
+    hidden, weight, labels = _inputs()
+    loss_sum, n_valid = chunked_lm_loss(hidden, weight, labels, chunk_size=7, ce=Recording())
+    ref, ref_n = chunked_lm_loss(hidden, weight, labels, chunk_size=7)
+    assert rows == [7] * 7 + [1] and n_valid == ref_n == 40
+    torch.testing.assert_close(loss_sum, ref, rtol=0, atol=0)
 
 
 def test_chunked_all_ignored_is_zero_and_connected():

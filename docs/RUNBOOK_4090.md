@@ -167,9 +167,11 @@ toda vez que um passo é pulado) e `nvidia-smi dmon -s pucm` (potência, clocks 
   `torch.compiler.disable`. O custo real vinha do grad checkpoint: o `torch.utils.checkpoint`
   desliga o Dynamo, então com `torch.compile(model)` o tronco inteiro rodava eager. Por isso o
   `compile_model` compila cada Block in-place (tronco e MTP) e deixa o checkpoint por fora. Sobra
-  um graph break inofensivo por bloco GDN, em volta do kernel do FLA. Embedding, norma final e a
-  loss em chunks rodam eager. O `int((labels != -100).sum())` de `chunked_lm_loss` continua
-  fazendo uma sincronização GPU→CPU por loss (LM e MTP) a cada forward.
+  um graph break inofensivo por bloco GDN, em volta do kernel do FLA. A CE de cada chunk da loss
+  (`SoreLM.chunk_ce`) também é compilada: eager, ela materializa logits fp32 e log-probs
+  `chunk × vocab` no backward, o que custava +1,2 GB no s150m a 2048. Embedding e normas fora dos
+  Blocks rodam eager. O `int((labels != -100).sum())` de `chunked_lm_loss` continua fazendo uma
+  sincronização GPU→CPU por loss (LM e MTP) a cada forward.
 - **N estático no compile.** O `compile_model` usa `dynamic=False`, porque o lowering do flex no
   Inductor falha com Q_LEN dinâmico (`CantSplit`). Só o nº de documentos (`len(cu_seqlens)`) é
   dinâmico (`SoreLM.trunk`). N muda só entre processos, nunca dentro de um treino: o `TrainConfig`
@@ -185,9 +187,11 @@ warmup e mediana dos outros 8. O comando base é
 | Variante | tok/s | MFU | VRAM pico (alocado / reservado) | 1º passo |
 |---|---:|---:|---:|---:|
 | eager (comando base) | 1.240 | 4,8% | 4,24 / 5,20 GB | 53 s |
-| `--compile` (por Block) | 2.300 | 8,8% | 4,24 / 4,56 GB | 66 s |
+| `--compile` (Blocks + CE da loss) | 2.959–3.227 | 11,4–12,4% | 3,00 / 3,28 GB | ~65 s a frio, ~10 s com o cache do Inductor |
 
-A GPU de notebook esquenta e o throughput oscila ~10–15% entre execuções.
+Para comparação, nas mesmas condições: o antigo `torch.compile(model)` fazia 2.335 tok/s com
+3,00 GB, e só os Blocks compilados (CE da loss eager) faziam 2.384–2.703 tok/s com 4,24 GB. A GPU
+de notebook esquenta e o throughput oscila ~10–15% entre execuções.
 
 No modo eager, com `--grad-accum 1`, cada passo de 2048 tokens gasta ~0,33 s no forward, ~0,87 s
 no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~22% do

@@ -17,7 +17,7 @@ from sore.model.block import Block
 from sore.model.config import ModelConfig
 from sore.model.gdn import GatedDeltaNet
 from sore.model.layers import RMSNorm, SwiGLU
-from sore.model.loss import chunked_lm_loss
+from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss
 from sore.model.mtp import MTPModule, mtp_labels, next_token_embeddings
 from sore.model.residual import GatedHyperResidual, PlainResidual, StreamFinal, init_stream
 
@@ -58,6 +58,7 @@ class SoreLM(nn.Module):
         self.norm = RMSNorm(cfg.d_model, eps=cfg.norm_eps)
         self.mtp = MTPModule(cfg) if cfg.mtp_layers > 0 else None
         self.lm_head = None if cfg.tie_embeddings else nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.chunk_ce = ChunkCrossEntropy()  # sem parâmetros; o compile_model o compila in-place
         self.init_weights()
 
     @property
@@ -131,14 +132,14 @@ class SoreLM(nn.Module):
             return LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)
 
         weight = self.head_weight
-        lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten())
+        lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), ce=self.chunk_ce)
         lm_loss = lm_sum / max(n_tokens, 1)
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
             h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens)
             targets = mtp_labels(labels, cu_seqlens)
-            mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten())
+            mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), ce=self.chunk_ce)
             mtp_loss = mtp_sum / max(n_mtp, 1)
             loss = lm_loss + self.cfg.mtp_weight * mtp_loss
         return LMOutput(loss=loss, lm_loss=lm_loss, mtp_loss=mtp_loss, n_tokens=n_tokens)
