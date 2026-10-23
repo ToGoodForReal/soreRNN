@@ -26,3 +26,8 @@ __pycache__/
 .venv/
 backup_old/
 *.bin
+
+# Python / v2
+runs/
+data/
+*.pt
