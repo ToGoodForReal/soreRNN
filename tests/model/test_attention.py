@@ -160,6 +160,26 @@ def test_flex_matches_sdpa():
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("t", [1, 127])
+def test_flex_short_sequence_uses_sdpa(t, dtype):
+    # T < 128: o flex compilado falha no Inductor ("Invalid FlexAttention decode kernel options",
+    # T=127); a camada usa o caminho do sdpa, com o mesmo resultado
+    sdpa = _layer(device="cuda", attn_backend="sdpa")
+    flex = _layer(device="cuda", attn_backend="flex")
+    flex.load_state_dict(sdpa.state_dict())
+    torch.manual_seed(3)
+    x = torch.randn(1, t, 128, device="cuda", requires_grad=True)
+    cu = _cu([0, t // 2, t] if t > 1 else [0, 1], device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+        for cu_seqlens in (None, cu):
+            out = flex(x, cu_seqlens)
+            torch.testing.assert_close(out, sdpa(x, cu_seqlens), atol=0, rtol=0)
+            out.float().sum().backward()
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.cuda
 def test_flex_backward_matches_sdpa():
     # o caminho de treino: gradientes dos pesos e da entrada iguais nos dois backends
     sdpa = _layer(device="cuda", attn_backend="sdpa")

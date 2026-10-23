@@ -208,6 +208,34 @@ def test_grad_checkpoint_matches(monkeypatch):
     assert calls == []
 
 
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_flex_block_mask_built_once_per_forward(monkeypatch):
+    # R24: um BlockMask por forward, compartilhado pelas camadas de atenção do tronco e pelo MTP,
+    # e o recompute do grad checkpoint não o refaz
+    import torch.nn.attention.flex_attention as flex_module
+
+    calls = []
+    real = flex_module.create_block_mask
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs["Q_LEN"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(flex_module, "create_block_mask", counting)
+    model = _model(n_layers=8, gdn_backend="fla", attn_backend="flex", grad_checkpoint=True).cuda()
+    ids, cu = _tokens(300, seed=1).cuda(), _cu([0, 120, 300]).cuda()
+    out = model(ids, cu, labels=_tokens(300, seed=2).cuda())
+    out.loss.backward()
+    assert calls == [300]  # 2 camadas de atenção + MTP, forward e recompute: um só BlockMask
+
+    # o BlockMask compartilhado dá o mesmo resultado que a máscara densa do sdpa
+    ref = _model(n_layers=8, gdn_backend="fla", attn_backend="sdpa").cuda()
+    ref.load_state_dict(model.state_dict())
+    with torch.no_grad():
+        torch.testing.assert_close(model.logits(ids, cu), ref.logits(ids, cu), atol=2e-3, rtol=0)
+
+
 def test_forward_variants():
     model = _model()
     ids, cu, labels = _tokens(30, seed=1), _cu(CU), _labels()

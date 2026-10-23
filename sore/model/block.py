@@ -12,7 +12,8 @@ class Block(nn.Module):
     """`H = res.write(H, f(norm(res.read(H))))` para o mixer e depois para a FFN.
 
     `mixer_type` é `"gdn"` (`GatedDeltaNet`) ou `"attn"` (`GatedAttention`). O stream `H` é
-    `[B,T,D]` (residual plain) ou `[B,T,n,D]` (hyper); `cu_seqlens` só vai para o mixer.
+    `[B,T,D]` (residual plain) ou `[B,T,n,D]` (hyper). `cu_seqlens` só vai para o mixer e
+    `block_mask` (o BlockMask do flex, montado uma vez por forward no `SoreLM`) só para a atenção.
     """
 
     def __init__(self, cfg: ModelConfig, layer_idx: int, mixer_type: str) -> None:
@@ -33,8 +34,10 @@ class Block(nn.Module):
         self.ffn = SwiGLU(cfg.d_model, cfg.ffn_dim)
         self.res_ffn = make_residual(cfg, layer_idx, sub=1)
 
-    def forward(self, H: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
-        H = self.res_mixer.write(H, self.mixer(self.norm1(self.res_mixer.read(H)), cu_seqlens))
+    def forward(self, H: Tensor, cu_seqlens: Tensor | None = None, block_mask=None) -> Tensor:
+        x = self.norm1(self.res_mixer.read(H))
+        y = self.mixer(x, cu_seqlens, block_mask) if self.mixer_type == "attn" else self.mixer(x, cu_seqlens)
+        H = self.res_mixer.write(H, y)
         H = self.res_ffn.write(H, self.ffn(self.norm2(self.res_ffn.read(H))))
         return H
 

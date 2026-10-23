@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from sore.model.attention import GatedAttention
+from sore.model.attention import FLEX_MIN_LEN, GatedAttention, doc_causal_block_mask
 from sore.model.block import Block
 from sore.model.config import ModelConfig
 from sore.model.gdn import GatedDeltaNet
@@ -102,8 +102,24 @@ class SoreLM(nn.Module):
             elif isinstance(m, GatedHyperResidual):
                 m.reset_parameters()
 
-    def trunk(self, x: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
-        """Embeddings `[B,T,D]` -> hidden final `[B,T,D]` (blocos, `StreamFinal` e norma final)."""
+    def attn_block_mask(self, x: Tensor, cu_seqlens: Tensor | None = None):
+        """BlockMask do flex para `x [B,T,D]`, ou None (sdpa, CPU ou T < `FLEX_MIN_LEN`).
+
+        Montado uma vez por forward e passado a todas as camadas de atenção, inclusive à do MTP
+        (ruling R24). Sem ele cada camada montaria o seu, a cada forward e a cada recompute.
+        """
+        t = x.shape[1]
+        if self.cfg.attn_backend != "flex" or not x.is_cuda or t < FLEX_MIN_LEN:
+            return None
+        return doc_causal_block_mask(cu_seqlens, t, x.device)
+
+    def trunk(self, x: Tensor, cu_seqlens: Tensor | None = None, block_mask=None) -> Tensor:
+        """Embeddings `[B,T,D]` -> hidden final `[B,T,D]` (blocos, `StreamFinal` e norma final).
+
+        `block_mask` é o de `attn_block_mask` (montado aqui quando não vem pronto).
+        """
+        if block_mask is None:
+            block_mask = self.attn_block_mask(x, cu_seqlens)
         H = init_stream(x, self.cfg)
         if cu_seqlens is not None:
             # O nº de documentos varia a cada micro-batch. Com o compile por Block (`compile_model`,
@@ -112,9 +128,9 @@ class SoreLM(nn.Module):
         use_checkpoint = self.cfg.grad_checkpoint and torch.is_grad_enabled()
         for block in self.blocks:
             if use_checkpoint:
-                H = checkpoint(block, H, cu_seqlens, use_reentrant=False)
+                H = checkpoint(block, H, cu_seqlens, block_mask, use_reentrant=False)
             else:
-                H = block(H, cu_seqlens)
+                H = block(H, cu_seqlens, block_mask)
         return self.norm(self.stream_final(H))
 
     def forward(
@@ -127,7 +143,8 @@ class SoreLM(nn.Module):
         if input_ids is None and inputs_embeds is None:
             raise ValueError("forward precisa de input_ids ou inputs_embeds")
         x = self.embed(input_ids) if inputs_embeds is None else inputs_embeds
-        h = self.trunk(x, cu_seqlens)
+        block_mask = self.attn_block_mask(x, cu_seqlens)  # um por forward: tronco e MTP
+        h = self.trunk(x, cu_seqlens, block_mask)
         if labels is None:
             return LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)
 
@@ -137,7 +154,7 @@ class SoreLM(nn.Module):
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
-            h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens)
+            h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask)
             targets = mtp_labels(labels, cu_seqlens)
             mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), ce=self.chunk_ce)
             mtp_loss = mtp_sum / max(n_mtp, 1)

@@ -178,6 +178,11 @@ treino quem manda é o λ do `TrainConfig`.
   1º backward do SoreLM (`AssertionError "509 v.s. 510"`). O trainer (e o `bench.py`) desliga a
   fusão automaticamente em `compile_model` (`sore/train/trainer.py`). Remova quando houver fix
   upstream.
+- **Flex com T < 128 usa o sdpa.** O flex compilado falha no Inductor com T=127 ("Invalid
+  FlexAttention decode kernel options"). A `GatedAttention` cai no sdpa denso abaixo de
+  `FLEX_MIN_LEN` = 128, o que não afeta o treino (N ≥ 4096). O BlockMask do flex é montado uma vez
+  por forward no `SoreLM` e compartilhado pelas camadas de atenção e pelo MTP (a T=8192, cada
+  montagem custa ~21 ms e ~670 MB transitórios).
 - **Mudar o lr no YAML não vale na retomada.** O `initial_lr` (e os demais hiperparâmetros dos
   param groups, como `weight_decay`) volta do checkpoint.
 - **`metrics.jsonl` pode repetir passos depois de crash + retomada.** Os passos após o último

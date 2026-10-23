@@ -48,6 +48,6 @@ class MTPModule(nn.Module):
         self.block = Block(dataclasses.replace(cfg, residual="plain"), layer_idx=cfg.n_layers, mixer_type="attn")
         self.final_norm = RMSNorm(d, eps=cfg.norm_eps)
 
-    def forward(self, h: Tensor, emb_next: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
+    def forward(self, h: Tensor, emb_next: Tensor, cu_seqlens: Tensor | None = None, block_mask=None) -> Tensor:
         x = self.proj(torch.cat([self.norm_h(h), self.norm_e(emb_next)], dim=-1))
-        return self.final_norm(self.block(x, cu_seqlens))
+        return self.final_norm(self.block(x, cu_seqlens, block_mask))
