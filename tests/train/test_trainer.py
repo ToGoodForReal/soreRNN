@@ -10,9 +10,10 @@ import torch
 
 import sore.model.lm as lm_module
 from sore.model import get_preset
+from sore.model.flops import flops_per_token
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
 from sore.train.data import write_token_shard
-from sore.train.trainer import TrainSummary, train
+from sore.train.trainer import TrainSummary, compile_model, train
 
 REPO = Path(__file__).resolve().parents[2]
 CPU_BACKENDS = {"gdn_backend": "torch", "attn_backend": "sdpa"}
@@ -80,7 +81,7 @@ def test_overfit(tmp_path):
     assert [m["step"] for m in metrics] == list(range(1, 41))
     assert set(metrics[0]) >= {
         "step", "tokens", "loss", "lm_loss", "mtp_loss", "grad_norm", "lr_muon", "tok_s", "mem_gb",
-        "seq_len", "skipped",
+        "seq_len", "skipped", "mfu",
     }
     losses = [m["loss"] for m in metrics]
     assert summary.last_loss == pytest.approx(losses[-1])
@@ -197,6 +198,36 @@ def test_step_loss_is_token_weighted_mean(tmp_path, monkeypatch):
     assert metrics["grad_norm"] == pytest.approx(ref_norm.item(), rel=1e-5)
 
 
+def test_metrics_include_mfu(tmp_path):
+    # mfu = flops_per_token(cfg do modelo, seq_len do passo) * tok_s / (peak_tflops * 1e12)
+    shard = _shard(tmp_path / "s.bin", 4000)
+    cfg = _cfg(tmp_path / "run", shard, RESUME_STAGES, steps=6, grad_accum=2, peak_tflops=0.5)
+    train(cfg, max_steps=5)  # cruza a troca de estágio 32 -> 64
+
+    model_cfg = get_preset("tiny", **CPU_BACKENDS)
+    metrics = _metrics(cfg.out_dir)
+    assert [m["seq_len"] for m in metrics] == [32, 32, 32, 64, 64]
+    for m in metrics:
+        expected = flops_per_token(model_cfg, m["seq_len"]) * m["tok_s"] / (0.5 * 1e12)
+        assert m["mfu"] == pytest.approx(expected, rel=1e-12) and m["mfu"] > 0
+
+
+def test_compile_model_disables_mix_order_reduction(monkeypatch):
+    # helper compartilhado pelo trainer e pelo scripts/bench.py
+    import torch._inductor.config as inductor_config
+
+    monkeypatch.setattr(inductor_config.triton, "mix_order_reduction", True)  # restaurado ao fim
+    seen = []
+
+    def fake_compile(model):
+        seen.append(inductor_config.triton.mix_order_reduction)
+        return "compiled"
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    assert compile_model(torch.nn.Linear(2, 2)) == "compiled"
+    assert seen == [False]
+
+
 def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
     # torch 2.14.1: o Inductor quebra no backward com mix_order_reduction ligado; o trainer desliga
     # antes de compilar. torch.compile é trocado por identidade (teste barato, sem compilar nada).
@@ -252,7 +283,12 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
     assert (cfg.lr_muon, cfg.warmup_steps, cfg.decay_frac, cfg.weight_decay, cfg.grad_clip) == (
         0.02, 500, 0.2, 0.1, 1.0
     )
-    assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device) == (False, 10, 0, "auto")
+    assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 165.0)
+
+
+def test_load_train_config_peak_tflops(tmp_path):
+    cfg = load_train_config(_yaml(tmp_path, extra="peak_tflops: 3.3e2\n"))  # str no PyYAML
+    assert cfg.peak_tflops == 330.0 and type(cfg.peak_tflops) is float
 
 
 @pytest.mark.parametrize(
@@ -272,8 +308,12 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
         ("  []", "50e9", "", "estágio"),
         (GOOD_STAGES, "50e9", "seq_length: 4096\n", "desconhecid"),
         (GOOD_STAGES, "50e9", "warmup_steps: 2.5\n", "warmup_steps"),
+        (GOOD_STAGES, "50e9", "peak_tflops: 0\n", "peak_tflops"),
     ],
-    ids=["tokens_per_microbatch", "not_ascending", "last_below_total", "empty", "unknown_key", "fractional"],
+    ids=[
+        "tokens_per_microbatch", "not_ascending", "last_below_total", "empty", "unknown_key", "fractional",
+        "peak_tflops_zero",
+    ],
 )
 def test_load_train_config_rejects_invalid(tmp_path, stages, total, extra, match):
     with pytest.raises(ValueError, match=match):

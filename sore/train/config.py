@@ -53,7 +53,7 @@ class Stage:
 
 
 _INT_FIELDS = ("eos_id", "grad_accum", "total_tokens", "warmup_steps", "log_every", "ckpt_every_tokens", "seed")
-_FLOAT_FIELDS = ("lr_muon", "lr_adamw", "decay_frac", "weight_decay", "grad_clip")
+_FLOAT_FIELDS = ("lr_muon", "lr_adamw", "decay_frac", "weight_decay", "grad_clip", "peak_tflops")
 
 
 @dataclass(kw_only=True)
@@ -84,6 +84,7 @@ class TrainConfig:
     out_dir: str
     seed: int = 0
     device: str = "auto"  # "auto" -> "cuda" se disponível, senão "cpu"
+    peak_tflops: float = 165.0  # pico BF16 denso da GPU (4090) para o MFU do metrics.jsonl
 
     def __post_init__(self) -> None:
         for name in _INT_FIELDS:
@@ -98,6 +99,8 @@ class TrainConfig:
             raise ValueError("é preciso ao menos um estágio em `stages`")
         if self.grad_accum < 1 or self.log_every < 1 or self.ckpt_every_tokens < 1:
             raise ValueError("grad_accum, log_every e ckpt_every_tokens devem ser >= 1")
+        if self.peak_tflops <= 0:
+            raise ValueError(f"peak_tflops deve ser > 0, recebeu {self.peak_tflops}")
         per_micro = {s.seq_len * s.micro_batch for s in self.stages}
         if len(per_micro) != 1:
             # tokens por passo constantes => o schedule por passo (WSD) é exato entre estágios

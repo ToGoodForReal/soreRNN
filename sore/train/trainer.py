@@ -13,6 +13,7 @@ import json
 import math
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 
 from sore.model import SoreLM, get_preset
+from sore.model.flops import flops_per_token
 from sore.model.loss import IGNORE_INDEX
 from sore.train.checkpoint import load_checkpoint, save_checkpoint
 from sore.train.config import Stage, TrainConfig, resolve_data_paths
@@ -59,6 +61,19 @@ def _sync_stage(stream: PackedTokenStream, stages: list[Stage]) -> bool:
         return False
     stream.set_shape(stage.seq_len, stage.micro_batch)
     return True
+
+
+def compile_model(model: torch.nn.Module) -> Callable:
+    """`torch.compile(model)` com o workaround do Inductor (usado pelo trainer e por `scripts/bench.py`).
+
+    torch 2.14.1: a fusão "mix order reduction" do Inductor quebra no 1º backward do SoreLM
+    (InductorError: AssertionError "509 v.s. 510" em MixOrderReduction.get_numel_rnumel).
+    Desligada até o fix upstream; equivale a TORCHINDUCTOR_MIX_ORDER_REDUCTION=0.
+    """
+    import torch._inductor.config as inductor_config
+
+    inductor_config.triton.mix_order_reduction = False
+    return torch.compile(model)
 
 
 def _autocast(device: torch.device):
@@ -119,15 +134,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     model = SoreLM(get_preset(cfg.model_preset, **cfg.model_overrides)).to(device)
     # otimizadores sobre o módulo sem wrapper: a divisão Muon/AdamW depende dos nomes dos parâmetros
     optimizers = build_optimizers(model, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay)
-    fwd = model
-    if cfg.compile:
-        # torch 2.14.1: a fusão "mix order reduction" do Inductor quebra no 1º backward do SoreLM
-        # (InductorError: AssertionError "509 v.s. 510" em MixOrderReduction.get_numel_rnumel).
-        # Desligada até o fix upstream; equivale a TORCHINDUCTOR_MIX_ORDER_REDUCTION=0.
-        import torch._inductor.config as inductor_config
-
-        inductor_config.triton.mix_order_reduction = False
-        fwd = torch.compile(model)
+    fwd = compile_model(model) if cfg.compile else model
     first = cfg.stages[0]
     stream = PackedTokenStream(
         resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed
@@ -170,6 +177,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
             tok_s = (stream.tokens_consumed - tokens_before) / (time.perf_counter() - t0)
             lr = optimizers[0].param_groups[0]["lr"]
             mem_gb = torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else 0.0
+            mfu = flops_per_token(model.cfg, stream.seq_len) * tok_s / (cfg.peak_tflops * 1e12)
 
             record = {
                 "step": step,
@@ -177,6 +185,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                 **{k: _json_float(stats[k]) for k in ("loss", "lm_loss", "mtp_loss", "grad_norm")},
                 "lr_muon": lr,
                 "tok_s": tok_s,
+                "mfu": mfu,
                 "mem_gb": mem_gb,
                 "seq_len": stream.seq_len,
                 "skipped": stats["skipped"],
@@ -187,7 +196,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
                 print(
                     f"step {step}/{total_steps} | loss {stats['loss']:.4f} (lm {stats['lm_loss']:.4f} "
                     f"mtp {stats['mtp_loss']:.4f}) | gnorm {stats['grad_norm']:.3f} | lr {lr:.2e} | "
-                    f"{tok_s:,.0f} tok/s | {mem_gb:.2f} GB | seq {stream.seq_len}"
+                    f"{tok_s:,.0f} tok/s | MFU {mfu:.1%} | {mem_gb:.2f} GB | seq {stream.seq_len}"
                     + (" | SKIPPED (grad norm não finito)" if stats["skipped"] else ""),
                     flush=True,
                 )
