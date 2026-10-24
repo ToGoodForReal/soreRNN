@@ -48,7 +48,7 @@ def test_init_loss_near_log_vocab():
     model = _model()
     out = model(_tokens(64, seed=1), labels=_tokens(64, seed=2))
     assert isinstance(out, LMOutput)
-    assert out.n_tokens == 64
+    assert out.n_tokens.dim() == 0 and out.n_tokens.dtype == torch.long and int(out.n_tokens) == 64
     assert abs(out.lm_loss.item() - math.log(512)) < 0.5
     assert abs(out.mtp_loss.item() - math.log(512)) < 0.5
     torch.testing.assert_close(out.loss, out.lm_loss + model.cfg.mtp_weight * out.mtp_loss)
@@ -126,7 +126,7 @@ def test_packed_loss_equal_separate():
         out = model(ids, cu, labels=labels)
         parts = [model(ids[:, a:b], labels=labels[:, a:b]) for a, b in DOCS]
 
-    assert out.n_tokens == sum(p.n_tokens for p in parts) == 27
+    assert int(out.n_tokens) == sum(int(p.n_tokens) for p in parts) == 27
     lm = sum(p.lm_loss * p.n_tokens for p in parts) / out.n_tokens
     torch.testing.assert_close(out.lm_loss, lm, atol=1e-5, rtol=0)
 
@@ -266,6 +266,85 @@ def test_packed_isolation_bf16_fla_flex():
     assert not bad, bad
 
 
+def _packed_cuda_batch(n=512, cu_list=(0, 100, 230, 300, 420, 512)):
+    """`ids`, `labels` e `cu_seqlens` na GPU, mais o `cu_seqlens` na CPU; o último token de cada documento é ignorado."""
+    ids, labels = _tokens(n, seed=1), _tokens(n, seed=2)
+    labels[0, [c - 1 for c in cu_list[1:]]] = -100
+    cu_cpu = _cu(list(cu_list))
+    return ids.cuda(), labels.cuda(), cu_cpu.cuda(), cu_cpu
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype:UserWarning")
+@pytest.mark.parametrize("grad_checkpoint", [False, True], ids=["eager", "grad_ckpt"])
+def test_microbatch_has_no_host_sync(grad_checkpoint):
+    # Alavanca C: forward + backward de um micro-batch (FLA + flex + MTP) não esperam a CPU. O
+    # `set_sync_debug_mode("error")` levanta em qualquer sincronização que o PyTorch detecta
+    # (`.item()`, `int(tensor)`, `nonzero`, cópia D2H...). O BlockMask é montado dentro do forward:
+    # o `create_block_mask` não sincroniza (medido), então não precisou do kwarg `block_mask=` para
+    # montá-lo antes de ligar o modo de depuração.
+    model = _model(gdn_backend="fla", attn_backend="flex", mtp_layers=1, grad_checkpoint=grad_checkpoint).cuda()
+
+    def step(batch):
+        ids, labels, cu, cu_cpu = batch
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model(ids, cu, labels=labels, cu_seqlens_cpu=cu_cpu)
+        out.loss.backward()
+
+    # O FLA guarda os índices de chunk por identidade do tensor: o passo medido usa tensores novos
+    # (mesmos valores), como cada micro-batch do trainer, para não cair no cache do aquecimento.
+    warmup, measured = _packed_cuda_batch(), _packed_cuda_batch()
+    step(warmup)  # aquece: compilação do flex e autotune do Triton podem sincronizar, o passo estável não
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step(measured)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_chunk_indices_without_sync_matches_fla():
+    # o substituto do `prepare_chunk_indices` do FLA devolve exatamente os mesmos índices
+    from fla.ops.utils.index import prepare_chunk_indices
+
+    from sore.model.gdn import chunk_indices_without_sync
+
+    for cu_list in ([0, 512], [0, 1, 64, 65, 200, 512], [0, 100, 230, 300, 420, 512]):
+        cu_cpu = _cu(cu_list)
+        for chunk_size in (16, 64):
+            ours = chunk_indices_without_sync(cu_cpu.cuda(), chunk_size, cu_cpu)
+            assert torch.equal(ours, prepare_chunk_indices(cu_cpu.cuda(), chunk_size)), (cu_list, chunk_size)
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_cu_seqlens_cpu_is_exact():
+    # `cu_seqlens_cpu` só evita ler o `cu_seqlens` da GPU no host: mesmos valores, mesmos kernels,
+    # então loss e gradientes são idênticos (`torch.equal`) com e sem ele. Antes disso, duas corridas
+    # iguais precisam ser bit a bit iguais entre si, senão a igualdade abaixo não provaria nada.
+    ids, labels, cu, cu_cpu = _packed_cuda_batch()
+
+    def run(cpu):
+        model = _model(gdn_backend="fla", attn_backend="flex").cuda()  # mesma seed, mesmos pesos
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model(ids, cu, labels=labels, cu_seqlens_cpu=cu_cpu if cpu else None)
+        out.loss.backward()
+        return out.loss.detach(), {n: p.grad for n, p in model.named_parameters()}
+
+    (loss_a, grads_a), (loss_b, grads_b) = run(False), run(False)
+    assert torch.equal(loss_a, loss_b) and all(torch.equal(grads_a[n], grads_b[n]) for n in grads_a), (
+        "o FLA não é bit a bit determinístico entre corridas: troque o torch.equal pela tolerância medida"
+    )
+    loss_c, grads_c = run(True)
+    assert torch.equal(loss_c, loss_a)
+    for name, g in grads_a.items():
+        assert torch.equal(grads_c[name], g), name
+
+
 def test_mtp_stream_is_fp32_under_autocast():
     # o stream residual do MTP é fp32 como o do tronco: a saída bf16 do `proj` (autocast) é convertida
     model = _model()
@@ -304,7 +383,7 @@ def test_forward_variants():
         # inputs_embeds sem input_ids: o tronco é o mesmo, mas o MTP é pulado
         emb_only = model(inputs_embeds=model.embed(ids), cu_seqlens=cu, labels=labels)
         no_labels = model(ids, cu)
-    assert emb_only.mtp_loss is None and emb_only.n_tokens == ref.n_tokens
+    assert emb_only.mtp_loss is None and int(emb_only.n_tokens) == int(ref.n_tokens)
     torch.testing.assert_close(emb_only.lm_loss, ref.lm_loss)
     torch.testing.assert_close(emb_only.loss, emb_only.lm_loss)
     assert no_labels == LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)

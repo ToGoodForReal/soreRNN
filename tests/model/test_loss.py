@@ -21,7 +21,9 @@ def test_chunked_matches_full():
     # chunk_size=7: 7 chunks cheios e uma sobra de 1 linha
     loss_sum, n_valid = chunked_lm_loss(hidden, weight, labels, chunk_size=7)
     assert loss_sum.dtype == torch.float32 and loss_sum.dim() == 0
-    assert isinstance(n_valid, int) and n_valid == 40
+    # a contagem é um tensor int64 0-dim, sem `int(...)`: ler o número na CPU sincronizaria a GPU
+    assert isinstance(n_valid, torch.Tensor) and n_valid.dtype == torch.long and n_valid.dim() == 0
+    assert n_valid.device == hidden.device and int(n_valid) == 40
     grad_h, grad_w = torch.autograd.grad(loss_sum, (hidden, weight))
 
     ref = F.cross_entropy(hidden @ weight.T, labels, ignore_index=-100, reduction="sum")
@@ -43,14 +45,14 @@ def test_chunked_uses_given_ce_module():
     hidden, weight, labels = _inputs()
     loss_sum, n_valid = chunked_lm_loss(hidden, weight, labels, chunk_size=7, ce=Recording())
     ref, ref_n = chunked_lm_loss(hidden, weight, labels, chunk_size=7)
-    assert rows == [7] * 7 + [1] and n_valid == ref_n == 40
+    assert rows == [7] * 7 + [1] and int(n_valid) == int(ref_n) == 40
     torch.testing.assert_close(loss_sum, ref, rtol=0, atol=0)
 
 
 def test_chunked_all_ignored_is_zero_and_connected():
     hidden, weight, labels = _inputs()
     loss_sum, n_valid = chunked_lm_loss(hidden, weight, torch.full_like(labels, -100), chunk_size=7)
-    assert n_valid == 0
+    assert int(n_valid) == 0
     assert loss_sum.item() == 0.0 and loss_sum.requires_grad
     loss_sum.backward()
     assert hidden.grad is not None and not hidden.grad.any()

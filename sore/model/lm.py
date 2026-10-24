@@ -26,21 +26,27 @@ from sore.model.residual import GatedHyperResidual, PlainResidual, StreamFinal, 
 class LMOutput:
     """`loss = lm_loss + mtp_weight * mtp_loss`, cada um a média sobre os seus tokens válidos.
 
-    `n_tokens` é o número de tokens válidos da loss do LM. Sem `labels` tudo é `None` e `n_tokens = 0`.
+    `n_tokens` é o número de tokens válidos da loss do LM: um tensor int64 0-dim no device (ler o
+    valor na CPU, com `int(...)`, sincroniza a GPU; quem precisa de um inteiro o converte fora do
+    micro-batch). Sem `labels` tudo é `None` e `n_tokens = 0` (um `int`).
     """
 
     loss: Tensor | None
     lm_loss: Tensor | None
     mtp_loss: Tensor | None
-    n_tokens: int
+    n_tokens: Tensor | int
 
 
 class SoreLM(nn.Module):
-    """LM híbrido soreQ4. `forward(input_ids [1,N], cu_seqlens, labels, inputs_embeds) -> LMOutput`.
+    """LM híbrido soreQ4. `forward(input_ids [1,N], cu_seqlens, labels, inputs_embeds, cu_seqlens_cpu) -> LMOutput`.
 
     `labels[t]` é o alvo da posição t (já deslocado, `-100` = ignorar). O MTP usa
     `mtp_labels(labels)`, ou seja, o token t+2. Com `inputs_embeds` e sem `input_ids` o MTP é
     pulado, porque o embedding do próximo token vem de `input_ids`.
+
+    `cu_seqlens_cpu` (opcional, long, CPU, os mesmos valores de `cu_seqlens`) evita que o FLA leia
+    o `cu_seqlens` da GPU no host: com ele, um micro-batch (forward e backward) não sincroniza com a
+    CPU. Não muda nenhum resultado.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -113,7 +119,13 @@ class SoreLM(nn.Module):
             return None
         return doc_causal_block_mask(cu_seqlens, t, x.device)
 
-    def trunk(self, x: Tensor, cu_seqlens: Tensor | None = None, block_mask=None) -> Tensor:
+    def trunk(
+        self,
+        x: Tensor,
+        cu_seqlens: Tensor | None = None,
+        block_mask=None,
+        cu_seqlens_cpu: Tensor | None = None,
+    ) -> Tensor:
         """Embeddings `[B,T,D]` -> hidden final `[B,T,D]` (blocos, `StreamFinal` e norma final).
 
         `block_mask` é o de `attn_block_mask` (montado aqui quando não vem pronto).
@@ -121,16 +133,17 @@ class SoreLM(nn.Module):
         if block_mask is None:
             block_mask = self.attn_block_mask(x, cu_seqlens)
         H = init_stream(x, self.cfg)
-        if cu_seqlens is not None:
-            # O nº de documentos varia a cada micro-batch. Com o compile por Block (`compile_model`,
-            # N estático) essa dimensão já entra dinâmica e não recompila a cada S. Em eager não faz nada.
-            torch._dynamo.maybe_mark_dynamic(cu_seqlens, 0)
+        # O nº de documentos varia a cada micro-batch. Com o compile por Block (`compile_model`,
+        # N estático) essa dimensão já entra dinâmica e não recompila a cada S. Em eager não faz nada.
+        for cu in (cu_seqlens, cu_seqlens_cpu):
+            if cu is not None:
+                torch._dynamo.maybe_mark_dynamic(cu, 0)
         use_checkpoint = self.cfg.grad_checkpoint and torch.is_grad_enabled()
         for block in self.blocks:
             if use_checkpoint:
-                H = checkpoint(block, H, cu_seqlens, block_mask, use_reentrant=False)
+                H = checkpoint(block, H, cu_seqlens, block_mask, cu_seqlens_cpu, use_reentrant=False)
             else:
-                H = block(H, cu_seqlens, block_mask)
+                H = block(H, cu_seqlens, block_mask, cu_seqlens_cpu)
         return self.norm(self.stream_final(H))
 
     def forward(
@@ -139,26 +152,27 @@ class SoreLM(nn.Module):
         cu_seqlens: Tensor | None = None,
         labels: Tensor | None = None,
         inputs_embeds: Tensor | None = None,
+        cu_seqlens_cpu: Tensor | None = None,
     ) -> LMOutput:
         if input_ids is None and inputs_embeds is None:
             raise ValueError("forward precisa de input_ids ou inputs_embeds")
         x = self.embed(input_ids) if inputs_embeds is None else inputs_embeds
         block_mask = self.attn_block_mask(x, cu_seqlens)  # um por forward: tronco e MTP
-        h = self.trunk(x, cu_seqlens, block_mask)
+        h = self.trunk(x, cu_seqlens, block_mask, cu_seqlens_cpu)
         if labels is None:
             return LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)
 
         weight = self.head_weight
         chunk = self.cfg.loss_chunk_size
         lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), chunk, ce=self.chunk_ce)
-        lm_loss = lm_sum / max(n_tokens, 1)
+        lm_loss = lm_sum / n_tokens.clamp(min=1)  # sem tokens válidos a soma é 0: loss 0, não 0/0
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
-            h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask)
+            h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask, cu_seqlens_cpu)
             targets = mtp_labels(labels, cu_seqlens)
             mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), chunk, ce=self.chunk_ce)
-            mtp_loss = mtp_sum / max(n_mtp, 1)
+            mtp_loss = mtp_sum / n_mtp.clamp(min=1)
             loss = lm_loss + self.cfg.mtp_weight * mtp_loss
         return LMOutput(loss=loss, lm_loss=lm_loss, mtp_loss=mtp_loss, n_tokens=n_tokens)
 

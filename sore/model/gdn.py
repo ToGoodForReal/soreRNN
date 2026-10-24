@@ -19,6 +19,52 @@ from sore.model.layers import RMSNorm
 from sore.model.varlen import doc_ids_from_cu_seqlens
 
 _DT_MIN, _DT_MAX = 1e-3, 1e-1
+_fla_patched = False
+
+
+def chunk_indices_without_sync(
+    cu_seqlens: Tensor, chunk_size: int, cu_seqlens_cpu: Tensor | None = None, *, original=None
+) -> Tensor:
+    """`fla.ops.utils.index.prepare_chunk_indices`, sem esperar a GPU: `[n_chunks, 2]` = (documento, chunk).
+
+    O do FLA 0.5.2 calcula os índices na CPU a partir do `cu_seqlens_cpu` e depois faz
+    `.to(cu_seqlens)`: uma cópia bloqueante de memória pageable, que sincroniza o stream da GPU
+    uma vez por micro-batch. Aqui os índices saem da própria GPU: só o nº total de chunks (`n_chunks`,
+    que dá o tamanho da saída) é lido, e vem do `cu_seqlens_cpu`; com `output_size` o
+    `repeat_interleave` não lê a soma na GPU. Sem `cu_seqlens_cpu` delega ao `original` do FLA.
+    """
+    if cu_seqlens_cpu is None:
+        return original(cu_seqlens, chunk_size)
+    n_chunks = int(((cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1] + chunk_size - 1) // chunk_size).sum())
+    counts = (cu_seqlens[1:] - cu_seqlens[:-1] + chunk_size - 1) // chunk_size
+    seg_id = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=counts.device, dtype=counts.dtype), counts, output_size=n_chunks
+    )
+    seg_start = F.pad(counts.cumsum(0), (1, 0))[:-1]
+    intra_chunk = torch.arange(n_chunks, device=counts.device, dtype=counts.dtype) - seg_start[seg_id]
+    return torch.stack([seg_id, intra_chunk], 1)
+
+
+def _patch_fla_chunk_indices() -> None:
+    """Troca o `prepare_chunk_indices` que o `chunk_gated_delta_rule` usa pelo `chunk_indices_without_sync`.
+
+    Uma vez por processo. O resultado fica no `tensor_cache` do FLA (por identidade dos tensores),
+    então as camadas GDN de um mesmo micro-batch, e o recompute do grad checkpoint, o calculam uma vez.
+    """
+    global _fla_patched
+    if _fla_patched:
+        return
+    import fla.ops.gated_delta_rule.chunk as fla_chunk
+    from fla.utils import tensor_cache
+
+    original = fla_chunk.prepare_chunk_indices
+
+    @tensor_cache
+    def prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=None):
+        return chunk_indices_without_sync(cu_seqlens, chunk_size, cu_seqlens_cpu, original=original)
+
+    fla_chunk.prepare_chunk_indices = prepare_chunk_indices
+    _fla_patched = True
 
 
 class GatedDeltaNet(nn.Module):
@@ -26,6 +72,10 @@ class GatedDeltaNet(nn.Module):
 
     `forward(x [B,T,D], cu_seqlens)`: com `cu_seqlens` (`[S+1]`, exige `B == 1`) a conv e o estado
     recorrente resetam em cada documento; sem ele, cada linha do batch é um documento.
+    `cu_seqlens_cpu` (mesmos valores, long, na CPU) vai ao kernel do FLA: sem ele o FLA lê o
+    `cu_seqlens` da GPU no host (`prepare_chunk_indices`) e a GPU espera a CPU. Mesmo com ele, o
+    FLA 0.5.2 copia os índices de chunk para a GPU com uma cópia bloqueante (sincroniza o stream);
+    por isso o backend `fla` troca esse passo por `chunk_indices_without_sync`.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -62,7 +112,7 @@ class GatedDeltaNet(nn.Module):
         self.o_norm = RMSNorm(self.head_dim, eps=cfg.norm_eps)
         self.o_proj = nn.Linear(v_dim, d, bias=False)
 
-    def forward(self, x: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, cu_seqlens: Tensor | None = None, cu_seqlens_cpu: Tensor | None = None) -> Tensor:
         b, t, _ = x.shape
         doc_ids = None if cu_seqlens is None else doc_ids_from_cu_seqlens(cu_seqlens, t)
 
@@ -82,8 +132,10 @@ class GatedDeltaNet(nn.Module):
         if self.backend == "fla":
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
+            _patch_fla_chunk_indices()
             o, _ = chunk_gated_delta_rule(
-                q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True
+                q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             o = naive_gated_delta_rule(

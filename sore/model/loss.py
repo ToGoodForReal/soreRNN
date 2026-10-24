@@ -32,8 +32,11 @@ def chunked_lm_loss(
     labels: Tensor,
     chunk_size: int = 8192,
     ce: Callable[[Tensor, Tensor, Tensor], Tensor] = _ce_sum,
-) -> tuple[Tensor, int]:
+) -> tuple[Tensor, Tensor]:
     """Soma da cross-entropy (fp32) e número de tokens válidos (`labels != -100`).
+
+    A contagem é um tensor int64 0-dim no device de `labels`, não um `int`: `int(tensor)` leria o
+    valor na CPU e faria a GPU esperar o host (duas vezes por micro-batch, com o MTP).
 
     `hidden [N,D]`, `weight [V,D]` (peso da cabeça de LM) e `labels [N]`. Cada chunk de até
     `chunk_size` linhas roda `ce` (a soma da CE do chunk, ex. `ChunkCrossEntropy`) sob
@@ -47,4 +50,4 @@ def chunked_lm_loss(
     for start in range(0, hidden.shape[0], chunk_size):
         end = start + chunk_size
         total = total + checkpoint(ce, hidden[start:end], weight, labels[start:end], use_reentrant=False)
-    return total, int((labels != IGNORE_INDEX).sum())
+    return total, (labels != IGNORE_INDEX).sum()

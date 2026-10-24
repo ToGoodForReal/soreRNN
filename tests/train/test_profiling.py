@@ -193,3 +193,23 @@ def test_bench_smoke_profile(tmp_path):
     assert row["kernels"]["gdn"] > 0 and row["kernels"]["attention"] > 0 and row["kernels"]["matmul"] > 0
     # as fases cobrem o passo inteiro (o passo medido inclui a montagem do batch)
     assert sum(row["phases"].values()) == pytest.approx(row["step_s"], rel=0.25)
+    assert row["cpu_cu_seqlens"] is True
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_bench_no_cpu_cu_seqlens_runs(tmp_path):
+    # `--no-cpu-cu-seqlens` é real: o modelo roda sem o `cu_seqlens_cpu` (o FLA lê o da GPU) e o JSON registra
+    out = tmp_path / "bench.jsonl"
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        [
+            sys.executable, str(root / "scripts" / "bench.py"),
+            "--preset", "tiny", "--override", "gdn_backend=fla", "--override", "attn_backend=flex",
+            "--seq-len", "256", "--micro-batch", "1", "--grad-accum", "2", "--steps", "2", "--warmup", "1",
+            "--no-cpu-cu-seqlens", "--out", str(out),
+        ],
+        check=True, cwd=root, timeout=600,
+    )
+    (row,) = [json.loads(line) for line in out.read_text().splitlines()]
+    assert row["cpu_cu_seqlens"] is False and row["tok_s"] > 0

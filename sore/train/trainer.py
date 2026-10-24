@@ -1,13 +1,14 @@
 """Loop de pré-treino retomável.
 
-Cada passo busca os `grad_accum` micro-batches antes do forward, conta os tokens válidos na CPU e
-faz o backward de `loss_mb * n_mb / n_passo`, com `loss_mb = lm_loss + λ(passo) * mtp_loss` (λ
-linear de `mtp_weight_start` a `mtp_weight_end`, R23): o loss do passo é a média ponderada por
-token. Depois vêm o clip do grad norm, a guarda de passo não finito (zera os grads e não anda
-nenhum otimizador), o lr `initial_lr * wsd(step)` e o passo dos otimizadores. O estágio do
-currículo de contexto é o primeiro com `until_tokens > tokens_consumed`, avaliado no início de
-cada passo. Depois do warmup, um loss acima de `(1 + spike_threshold)` × a EMA do loss marca
-`"spike": true` no metrics.jsonl e imprime um aviso.
+Cada passo busca os `grad_accum` micro-batches antes do forward, conta os tokens válidos na CPU,
+copia todos para a GPU (pinned, `non_blocking`) e faz o backward de `loss_mb * n_mb / n_passo`,
+com `loss_mb = lm_loss + λ(passo) * mtp_loss` (λ linear de `mtp_weight_start` a `mtp_weight_end`,
+R23): o loss do passo é a média ponderada por token. Depois vêm o clip do grad norm, a guarda de
+passo não finito (zera os grads e não anda nenhum otimizador), o lr `initial_lr * wsd(step)` e o
+passo dos otimizadores. O estágio do currículo de contexto é o primeiro com
+`until_tokens > tokens_consumed`, avaliado no início de cada passo. Depois do warmup, um loss
+acima de `(1 + spike_threshold)` × a EMA do loss marca `"spike": true` no metrics.jsonl e imprime
+um aviso.
 
 Checkpoints (R27): `last.pt` a cada `ckpt_every_tokens`, snapshots numerados a cada
 `snapshot_every_tokens` (os `keep_snapshots` mais novos ficam) e `last.pt` na fronteira do passo
@@ -125,27 +126,41 @@ def _autocast(device: torch.device):
     return contextlib.nullcontext()  # CPU: fp32
 
 
+def _to_device(batch, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`(input_ids, cu_seqlens, labels)` na GPU. Em CUDA a origem é pinned e a cópia `non_blocking`.
+
+    Cópia `non_blocking` de memória pageable é síncrona (o driver a copia para um buffer pinned
+    antes); da pinned, a cópia só entra na fila da GPU e o host segue. Em CPU não há o que copiar.
+    """
+    tensors = (batch.input_ids, batch.cu_seqlens, batch.labels)
+    if device.type == "cuda":
+        tensors = tuple(t.pin_memory() for t in tensors)
+    return tuple(t.to(device, non_blocking=True) for t in tensors)
+
+
 def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float, mtp_weight: float) -> dict:
     """Um passo de otimização; devolve as métricas do passo (médias ponderadas por token).
 
     O loss de cada micro-batch é `lm_loss + mtp_weight * mtp_loss`. O `out.loss` do modelo (que usa
     o `mtp_weight` fixo do ModelConfig) é ignorado.
+
+    Entrada (D3): os `grad_accum` batches são copiados para a GPU de uma vez (pinned, `non_blocking`)
+    antes do 1º forward, e o `cu_seqlens` da CPU vai junto ao modelo (`cu_seqlens_cpu`). Assim nada
+    dentro do loop de micro-batches espera a CPU: a contagem de tokens válidos de cada um já está na
+    CPU (`n_valid`) e o `out.n_tokens` do modelo, um tensor, não é lido aqui.
     """
     batches = [next(stream) for _ in range(cfg.grad_accum)]
     n_valid = [int((b.labels != IGNORE_INDEX).sum()) for b in batches]
     n_step = sum(n_valid)
+    inputs = [_to_device(b, device) for b in batches]
     # loss, lm_loss, mtp_loss; passo sem nenhum token válido não tem loss (NaN -> null no log)
     sums = torch.zeros(3, device=device) if n_step else torch.full((3,), math.nan, device=device)
-    for batch, n in zip(batches, n_valid):
+    for batch, (input_ids, cu_seqlens, labels), n in zip(batches, inputs, n_valid):
         if n == 0:
             continue
         weight = n / n_step
         with _autocast(device):
-            out = model(
-                batch.input_ids.to(device, non_blocking=True),
-                cu_seqlens=batch.cu_seqlens.to(device, non_blocking=True),
-                labels=batch.labels.to(device, non_blocking=True),
-            )
+            out = model(input_ids, cu_seqlens=cu_seqlens, labels=labels, cu_seqlens_cpu=batch.cu_seqlens)
         if out.mtp_loss is None:
             loss, mtp = out.lm_loss, torch.full_like(out.lm_loss, math.nan)  # sem MTP -> null
         else:

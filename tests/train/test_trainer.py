@@ -196,7 +196,7 @@ def test_step_loss_is_token_weighted_mean(tmp_path, monkeypatch):
     train(cfg, max_steps=1)
     monkeypatch.undo()
 
-    counts = [out.n_tokens for *_, out in calls]
+    counts = [int(out.n_tokens) for *_, out in calls]  # tensor 0-dim: o trainer não o converte no micro-batch
     assert len(calls) == 7 and 16 in counts  # o micro-batch sem tokens válidos não roda
     total = sum(counts)
     (metrics,) = _metrics(cfg.out_dir)
@@ -315,6 +315,69 @@ def test_mtp_weight_can_change_on_resume(tmp_path):
     train(cfg, max_steps=1)
     changed = dataclasses.replace(cfg, model_overrides={**CPU_BACKENDS, "mtp_weight": 0.5, "loss_chunk_size": 16})
     assert train(changed, resume=Path(cfg.out_dir) / "last.pt", max_steps=1).steps == 2
+
+
+def test_resume_checkpoint_without_new_fields(tmp_path):
+    # Formato antigo: um last.pt de antes dos campos de execução novos tem um `model_cfg` sem eles
+    # (aqui `loss_chunk_size`, removido do dict antes do torch.save). Campo de execução ausente
+    # vale o default do ModelConfig: a retomada não pode falhar nem exigir o campo.
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(10 * 128, 32, 4)], steps=10)
+    train(cfg, max_steps=1)
+    last = Path(cfg.out_dir) / "last.pt"
+    ckpt = torch.load(last, map_location="cpu", weights_only=True)
+    assert "loss_chunk_size" in ckpt["model_cfg"]
+    del ckpt["model_cfg"]["loss_chunk_size"]
+    torch.save(ckpt, last)
+
+    assert train(cfg, resume=last, max_steps=1).steps == 2
+
+
+def test_train_step_passes_cpu_cu_seqlens(tmp_path, monkeypatch):
+    # o trainer entrega ao modelo o cu_seqlens também na CPU (cu_seqlens_cpu): é o que evita o
+    # sync do FLA; os mesmos valores do cu_seqlens do micro-batch
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(3 * 256, 32, 4)], steps=3, grad_accum=2)
+    original, seen = lm_module.SoreLM.forward, []
+
+    def recording_forward(self, input_ids, cu_seqlens=None, labels=None, **kwargs):
+        seen.append((cu_seqlens, kwargs.get("cu_seqlens_cpu")))
+        return original(self, input_ids, cu_seqlens=cu_seqlens, labels=labels, **kwargs)
+
+    monkeypatch.setattr(lm_module.SoreLM, "forward", recording_forward)
+    train(cfg, max_steps=1)
+
+    assert len(seen) == 2
+    for cu, cu_cpu in seen:
+        assert cu_cpu is not None and cu_cpu.device.type == "cpu" and cu_cpu.dtype == torch.long
+        assert torch.equal(cu_cpu, cu.cpu())
+
+
+@pytest.mark.cuda
+def test_train_step_pins_and_copies_all_batches_before_first_forward(tmp_path, monkeypatch):
+    # D3: no início do passo os `grad_accum` batches são pinned e copiados (non_blocking) para a GPU,
+    # todos antes do 1º forward; os backends de CPU (torch/sdpa) bastam, o foco é a entrada
+    shard = _shard(tmp_path / "s.bin", 1000)
+    cfg = _cfg(tmp_path / "run", shard, [Stage(3 * 384, 32, 4)], steps=3, grad_accum=3, device="cuda")
+    events = []
+    real_pin = torch.Tensor.pin_memory
+
+    def recording_pin(self, *args, **kwargs):
+        events.append("pin")
+        return real_pin(self, *args, **kwargs)
+
+    original = lm_module.SoreLM.forward
+
+    def recording_forward(self, input_ids, *args, **kwargs):
+        events.append("forward")
+        assert input_ids.is_cuda and kwargs["cu_seqlens_cpu"].device.type == "cpu"
+        return original(self, input_ids, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", recording_pin)
+    monkeypatch.setattr(lm_module.SoreLM, "forward", recording_forward)
+    train(cfg, max_steps=1)
+
+    assert events == ["pin"] * 9 + ["forward"] * 3  # 3 tensores x 3 micro-batches, depois os forwards
 
 
 def test_metrics_include_mfu(tmp_path):

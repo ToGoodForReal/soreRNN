@@ -6,8 +6,9 @@ Monta o preset na GPU (backends de GDN e atenção do próprio preset, mais os `
 número de documentos para não mudar shapes). Com `--doc-lengths` (o `doc_lengths.json` da amostra PT),
 os comprimentos são sorteados dessa distribuição real, janela a janela (um documento nunca atravessa
 a janela), então o número de documentos varia entre micro-batches, como no treino.
-Cada passo é o do trainer: monta e copia os `--grad-accum` micro-batches (fase `data`), faz o
-forward com labels e o backward de cada um (autocast bf16, fase `fwd_bwd`), o clip do grad norm
+Cada passo é o do trainer: monta os `--grad-accum` micro-batches e copia todos para a GPU de uma
+vez, pinned e `non_blocking`, antes do 1º forward (fase `data`), faz o forward com labels e o
+backward de cada um (autocast bf16, `cu_seqlens_cpu` junto, fase `fwd_bwd`), o clip do grad norm
 (`clip`) e um passo do Muon + AdamW (`optimizer`). O passo do otimizador (Newton-Schulz do Muon)
 pesa muito com `--grad-accum 1`; no treino real ele se dilui em 16-64 micro-batches. Mede a mediana
 de tok/s dos passos após o `--warmup` (o tempo do passo inclui a fase `data`), o MFU via
@@ -19,8 +20,8 @@ o 2º fica sob o `torch.profiler`), e soma o tempo de GPU do 2º por categoria d
 (`sore.train.profiling`), mais `idle`: a parede desse passo menos a união dos intervalos de kernels
 (a GPU esperando a CPU). O passo perfilado tem o overhead do profiler e não inclui a montagem do batch.
 
-`--no-cpu-cu-seqlens` ainda não faz nada: o modelo só passa a aceitar `cu_seqlens_cpu` na Task 4
-do plano de throughput, e o bench só passa esse argumento a partir de lá.
+`--no-cpu-cu-seqlens` não passa o `cu_seqlens_cpu` ao modelo: o FLA volta a ler o `cu_seqlens` da GPU
+no host (um sync por micro-batch no `prepare_chunk_indices`). Serve para medir o ganho de não sincronizar.
 
 `--out FILE.jsonl` acrescenta uma linha JSON por execução (a mesma do `--json`).
 
@@ -60,7 +61,7 @@ def synthetic_batch(
     micro_batch: int,
     vocab: int,
     gen: torch.Generator,
-    doc_lengths: Sequence[int] | None = None,
+    doc_lengths: Sequence[int] | np.ndarray | None = None,
     rng: np.random.Generator | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """`input_ids` e `labels` `[1, N]` aleatórios e o `cu_seqlens` dos documentos.
@@ -88,14 +89,15 @@ def synthetic_batch(
 def train_step(
     model: SoreLM,
     optimizers: list[torch.optim.Optimizer],
-    make_batches: Callable[[], list[tuple[Tensor, ...]]],
+    make_batches: Callable[[], list[tuple[Tensor, Tensor, Tensor, Tensor | None]]],
     device: torch.device,
 ) -> tuple[float, dict[str, float]]:
     """Um passo do trainer; devolve `(parede_s, fases_s)`.
 
-    Monta os micro-batches (`make_batches`, já na GPU), faz o backward de cada um (loss / n), o clip em
-    1.0 e o passo dos otimizadores. As fases `PHASES` saem de eventos CUDA gravados entre elas: com a
-    GPU esperando a CPU, o tempo ocioso entra na fase em que ocorreu (as fases somam a parede).
+    Monta os micro-batches (`make_batches`: `(ids, labels, cu_seqlens, cu_seqlens_cpu)`, já na GPU e
+    com o `cu_seqlens_cpu` na CPU, ou `None`), faz o backward de cada um (loss / n), o clip em 1.0 e o
+    passo dos otimizadores. As fases `PHASES` saem de eventos CUDA gravados entre elas: com a GPU
+    esperando a CPU, o tempo ocioso entra na fase em que ocorreu (as fases somam a parede).
     """
     marks = [torch.cuda.Event(enable_timing=True) for _ in range(len(PHASES) + 1)]
     torch.cuda.synchronize(device)
@@ -103,9 +105,9 @@ def train_step(
     marks[0].record()
     batches = make_batches()
     marks[1].record()
-    for ids, labels, cu_seqlens in batches:
+    for ids, labels, cu_seqlens, cu_seqlens_cpu in batches:
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = model(ids, cu_seqlens=cu_seqlens, labels=labels)
+            out = model(ids, cu_seqlens=cu_seqlens, labels=labels, cu_seqlens_cpu=cu_seqlens_cpu)
         (out.loss / len(batches)).backward()
     marks[2].record()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -142,7 +144,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-cpu-cu-seqlens", action="store_true",
-        help="(sem efeito até a Task 4) não passa o cu_seqlens_cpu ao modelo",
+        help="não passa o cu_seqlens_cpu ao modelo (o FLA sincroniza com a GPU a cada micro-batch)",
     )
     parser.add_argument("--profile", action="store_true", help="um passo extra no torch.profiler: tempo por categoria de kernel")
     parser.add_argument("--out", type=Path, help="acrescenta o resultado, em uma linha JSON, a este arquivo .jsonl")
@@ -158,7 +160,11 @@ def main() -> None:
         cfg = get_preset(args.preset, **{"grad_checkpoint": args.grad_checkpoint, **overrides})
     except (ValueError, KeyError, TypeError) as e:
         parser.error(f"--preset/--override inválido: {e}")
-    doc_lengths = json.loads(args.doc_lengths.read_text())["lengths"] if args.doc_lengths else None
+    # Um array numpy, uma vez: o `np.asarray` do `sample_doc_lengths` vira de graça a cada janela e a
+    # fase `data` mede só a montagem do batch e a cópia para a GPU, não converter a lista toda vez.
+    doc_lengths = (
+        np.asarray(json.loads(args.doc_lengths.read_text())["lengths"], dtype=np.int64) if args.doc_lengths else None
+    )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -179,13 +185,16 @@ def main() -> None:
     gen = torch.Generator().manual_seed(0)
     doc_rng = np.random.default_rng(0)
 
-    def make_batches() -> list[tuple[Tensor, ...]]:
-        return [
-            tuple(
-                t.to(device)
-                for t in synthetic_batch(args.seq_len, args.micro_batch, cfg.vocab_size, gen, doc_lengths, doc_rng)
-            )
+    def make_batches() -> list[tuple[Tensor, Tensor, Tensor, Tensor | None]]:
+        # como o trainer (D3): monta os `grad_accum` batches e copia todos (pinned, non_blocking) antes do 1º forward
+        host = [
+            synthetic_batch(args.seq_len, args.micro_batch, cfg.vocab_size, gen, doc_lengths, doc_rng)
             for _ in range(args.grad_accum)
+        ]
+        cu_cpu = [None if args.no_cpu_cu_seqlens else cu for _, _, cu in host]
+        return [
+            (*(t.pin_memory().to(device, non_blocking=True) for t in batch), cpu)
+            for batch, cpu in zip(host, cu_cpu)
         ]
 
     times: list[float] = []
@@ -207,6 +216,7 @@ def main() -> None:
         "preset": args.preset,
         "overrides": overrides,
         "doc_lengths": str(args.doc_lengths) if args.doc_lengths else None,
+        "cpu_cu_seqlens": not args.no_cpu_cu_seqlens,
         "seq_len": args.seq_len,
         "micro_batch": args.micro_batch,
         "grad_accum": args.grad_accum,
