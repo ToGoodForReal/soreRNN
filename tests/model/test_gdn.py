@@ -164,19 +164,30 @@ def test_fla_options_match_torch_backend(option_set, rep, cu_case):
 
 @pytest.mark.cuda
 @pytest.mark.fla
-@pytest.mark.parametrize("option_set", ["none", "all"])
-def test_fla_options_isolate_documents(option_set):
-    # mudar os tokens do documento 4 ([70, 200)) não pode alterar a saída dos documentos 0-3 ([0, 70)):
-    # a conv e o estado resetam em cada documento, inclusive nos de 1-3 tokens (< K=4 e < chunk 64)
-    layer, _ = _fla_twin_layers(_OPTION_SETS[option_set], rep=2)
-    cu = _cu(_CU_CASES["short_docs"], "cuda")
+@pytest.mark.parametrize("rep", [1, 2], ids=["no_gva", "gva2x"])
+@pytest.mark.parametrize("option_set", sorted(_OPTION_SETS))
+def test_fla_options_isolate_documents(option_set, rep):
+    # Vazamento só acontece de um documento ANTERIOR para um posterior (conv e delta rule são causais:
+    # mudar tokens posteriores nunca altera saídas anteriores, com ou sem o reset). Por isso o teste
+    # perturba documentos anteriores e exige que os posteriores não mudem, inclusive depois dos de 1-3
+    # tokens (< K=4 e < chunk 64).
+    layer, _ = _fla_twin_layers(_OPTION_SETS[option_set], rep)
+    cu = _cu(_CU_CASES["short_docs"], "cuda")  # docs: [0,1) [1,3) [3,4) [4,70) [70,200) [200,512)
     gen = torch.Generator(device="cuda").manual_seed(3)
     x = torch.randn(1, 512, 128, device="cuda", generator=gen)
-    x2 = x.clone()
-    x2[:, 70:200] = torch.randn(1, 130, 128, device="cuda", generator=gen)
 
-    with torch.no_grad():
-        out = layer(x, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu())
-        out2 = layer(x2, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu())
-    torch.testing.assert_close(out[:, :70], out2[:, :70], atol=1e-6, rtol=0)
-    assert not torch.allclose(out[:, 70:200], out2[:, 70:200], atol=1e-3)  # o teste enxerga a mudança
+    def run(inp, packed=True):
+        with torch.no_grad():
+            return layer(inp, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu()) if packed else layer(inp)
+
+    out = run(x)
+    for start, end, first_unchanged in ((0, 4, 4), (4, 70, 70)):  # (a) docs de 1-3 tokens; (b) doc [4, 70)
+        x2 = x.clone()
+        x2[:, start:end] = torch.randn(1, end - start, 128, device="cuda", generator=gen)
+        out2 = run(x2)
+        torch.testing.assert_close(out[:, first_unchanged:], out2[:, first_unchanged:], atol=1e-6, rtol=0)
+        assert not torch.allclose(out[:, start:end], out2[:, start:end], atol=1e-3)  # o teste enxerga a mudança
+        # controle negativo: sem `cu_seqlens` (sem reset) o mesmo teste tem de falhar, ou seja, a
+        # asserção acima detecta de fato um reset quebrado
+        leak, leak2 = run(x, packed=False), run(x2, packed=False)
+        assert (leak[:, first_unchanged:] - leak2[:, first_unchanged:]).abs().max() > 1e-3
