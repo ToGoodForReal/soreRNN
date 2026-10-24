@@ -48,6 +48,11 @@ class ModelConfig:
     attn_backend: Literal["sdpa", "flex"] = "sdpa"
     grad_checkpoint: bool = False
     loss_chunk_size: int = 8192
+    # Caminho do GDN (só `gdn_backend="fla"`): cada opção troca um trecho em PyTorch por um kernel do
+    # FLA, com o mesmo resultado (paridade contra o backend `torch`) e sem mudar o state_dict.
+    gdn_kernel_gate: bool = False  # g = -exp(A_log)·softplus(a + dt_bias) e sigmoid(beta) dentro do kernel
+    gdn_fla_conv: bool = False  # conv causal + SiLU do FLA no lugar de `causal_conv1d_varlen` + F.silu
+    fused_norm_gate: bool = False  # RMSNorm · silu(gate) da saída do GDN num kernel só
 
     def __post_init__(self) -> None:
         # YAML/JSON devolvem lista; normaliza para tupla (hashable e comparável)
@@ -68,6 +73,10 @@ class ModelConfig:
             )
         if self.loss_chunk_size <= 0:
             raise ValueError(f"loss_chunk_size deve ser positivo; recebi {self.loss_chunk_size}")
+        if self.gdn_backend != "fla":
+            for flag in ("gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate"):
+                if getattr(self, flag):
+                    raise ValueError(f"{flag}=True exige gdn_backend='fla'; recebi gdn_backend={self.gdn_backend!r}")
 
     def layer_types(self) -> list[str]:
         """Tipo de cada camada (`"gdn"` ou `"attn"`), repetindo `layer_pattern`."""
@@ -97,12 +106,14 @@ PRESETS: dict[str, ModelConfig] = {
         gdn_qk_heads=6, gdn_v_heads=12,
         attn_heads=6, attn_kv_heads=2,
         mtp_layers=1, gdn_backend="fla", attn_backend="flex",
+        gdn_kernel_gate=True, gdn_fla_conv=True, fused_norm_gate=True,
     ),
     "b0_8": ModelConfig(
         vocab_size=65536, d_model=1280, n_layers=24, ffn_dim=4352,
         gdn_qk_heads=10, gdn_v_heads=20,
         attn_heads=10, attn_kv_heads=2,
         mtp_layers=1, gdn_backend="fla", attn_backend="flex",
+        gdn_kernel_gate=True, gdn_fla_conv=True, fused_norm_gate=True,
     ),
 }
 

@@ -19,9 +19,13 @@ QUALITY_DIR=${QUALITY_DIR:-runs/quality}
 # ----------------------------------------------------------------------------------------------
 # PONTO DE EXTENSÃO 1 (cada task de alavanca mexe aqui): ALL_OFF = overrides que DESLIGAM todas as
 # alavancas da lista, um `KEY=VALUE` por elemento. Vale para toda corrida (refs e candidatas), então
-# a candidata difere da referência só pela alavanca que a sua linha liga. Começa vazio.
+# a candidata difere da referência só pela alavanca que a sua linha liga. Os presets s150m/b0_8
+# já trazem as alavancas do GDN ligadas; é o ALL_OFF que faz as referências rodarem o caminho antigo.
 # Ex. de uma task de alavanca: ALL_OFF+=("model_overrides.fused_ce=false")
 ALL_OFF=(
+  "model_overrides.gdn_kernel_gate=false"
+  "model_overrides.gdn_fla_conv=false"
+  "model_overrides.fused_norm_gate=false"
 )
 
 # PONTO DE EXTENSÃO 2: as corridas, `NOME:override;override;...` (separador `;`, pois valores como
@@ -31,6 +35,7 @@ ALL_OFF=(
 RUNS=(
   "ref_s0:seed=0"
   "ref_s1:seed=1"
+  "gdn_path:model_overrides.gdn_kernel_gate=true;model_overrides.gdn_fla_conv=true;model_overrides.fused_norm_gate=true"
 )
 
 # PONTO DE EXTENSÃO 3: nomes de candidatas COM perda (gap <= 1%); só vale se a exata ficar < 15k tok/s.

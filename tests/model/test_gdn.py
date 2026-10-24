@@ -99,3 +99,84 @@ def test_fla_matches_torch():
     for actual, expected in ((gx_fla, gx_ref), (gq_fla, gq_ref)):
         atol = 5e-3 * expected.abs().max().item()
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=atol)
+
+
+# --- Task 5: caminho do GDN (GVA nativo, gate no kernel, conv do FLA, norma com gate fundida) ---
+
+_OPTIONS = ("gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate")
+_OPTION_SETS = {
+    "none": (),  # só o GVA nativo, que no backend fla vale sempre (D4)
+    "kernel_gate": ("gdn_kernel_gate",),
+    "fla_conv": ("gdn_fla_conv",),
+    "fused_norm_gate": ("fused_norm_gate",),
+    "all": _OPTIONS,
+}
+# documentos de 1-3 tokens (menores que K=4 e que o chunk 64) e um documento na janela inteira
+_CU_CASES = {"short_docs": [0, 1, 3, 4, 70, 200, 512], "one_doc": [0, 512]}
+
+
+def _fla_twin_layers(options, rep, seed=0):
+    """Camada `fla` com as `options` ligadas e o gêmeo `torch` (referência) com os mesmos pesos."""
+    kw = dict(gdn_qk_heads=2, gdn_v_heads=2 * rep, **{o: True for o in options})
+    torch.manual_seed(seed)
+    fla_layer = GatedDeltaNet(get_preset("tiny", gdn_backend="fla", **kw)).cuda()
+    ref_layer = GatedDeltaNet(get_preset("tiny", gdn_backend="torch", gdn_qk_heads=2, gdn_v_heads=2 * rep)).cuda()
+    ref_layer.load_state_dict(fla_layer.state_dict())
+    return fla_layer, ref_layer
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+@pytest.mark.parametrize("cu_case", sorted(_CU_CASES))
+@pytest.mark.parametrize("rep", [1, 2], ids=["no_gva", "gva2x"])
+@pytest.mark.parametrize("option_set", sorted(_OPTION_SETS))
+def test_fla_options_match_torch_backend(option_set, rep, cu_case):
+    fla_layer, ref_layer = _fla_twin_layers(_OPTION_SETS[option_set], rep)
+    cu = _cu(_CU_CASES[cu_case], "cuda")
+    cu_cpu = cu.cpu()
+
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    x = torch.randn(1, 512, 128, device="cuda", generator=gen)
+    cotangent = torch.randn(1, 512, 128, device="cuda", generator=gen)
+
+    results = {}
+    for name, layer in (("fla", fla_layer), ("torch", ref_layer)):
+        xi = x.clone().requires_grad_(True)
+        out = layer(xi, cu_seqlens=cu, cu_seqlens_cpu=cu_cpu if name == "fla" else None)
+        (out * cotangent).sum().backward()
+        grads = {n: p.grad for n, p in layer.named_parameters()}
+        results[name] = (out.detach(), xi.grad, grads)
+
+    (out_fla, gx_fla, g_fla), (out_ref, gx_ref, g_ref) = results["fla"], results["torch"]
+    # mesmas tolerâncias de `test_fla_matches_torch` (os tl.dot do FLA em fp32 usam TF32; um erro de
+    # convenção dá erro relativo O(1)) para a saída, o grad de x e o de cada parâmetro, menos A_log e
+    # dt_bias. Esses dois são escalares por head somados sobre os 512 tokens e passam pela cadeia do
+    # decaimento (cumsum de g): o ruído do TF32 chega a 3e-2 * max|ref| nos 20 casos medidos (também na
+    # opção "none", que usa o gate antigo), e a 6e-5 * max|ref| com TRITON_F32_DEFAULT=ieee em todos os
+    # casos (as 15 grandezas comparadas ficam em <= 2e-4). Não é erro de convenção; para esses dois o
+    # atol é 5e-2 * max|ref|.
+    torch.testing.assert_close(out_fla, out_ref, atol=1e-3, rtol=0)
+    pairs = [("x", gx_fla, gx_ref)] + [(n, g_fla[n], g_ref[n]) for n in g_ref]
+    for name, actual, expected in pairs:
+        atol = (5e-2 if name in ("A_log", "dt_bias") else 5e-3) * expected.abs().max().item()
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=atol, msg=lambda m, n=name: f"{n}: {m}")
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+@pytest.mark.parametrize("option_set", ["none", "all"])
+def test_fla_options_isolate_documents(option_set):
+    # mudar os tokens do documento 4 ([70, 200)) não pode alterar a saída dos documentos 0-3 ([0, 70)):
+    # a conv e o estado resetam em cada documento, inclusive nos de 1-3 tokens (< K=4 e < chunk 64)
+    layer, _ = _fla_twin_layers(_OPTION_SETS[option_set], rep=2)
+    cu = _cu(_CU_CASES["short_docs"], "cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    x = torch.randn(1, 512, 128, device="cuda", generator=gen)
+    x2 = x.clone()
+    x2[:, 70:200] = torch.randn(1, 130, 128, device="cuda", generator=gen)
+
+    with torch.no_grad():
+        out = layer(x, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu())
+        out2 = layer(x2, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu())
+    torch.testing.assert_close(out[:, :70], out2[:, :70], atol=1e-6, rtol=0)
+    assert not torch.allclose(out[:, 70:200], out2[:, 70:200], atol=1e-3)  # o teste enxerga a mudança

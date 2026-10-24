@@ -52,14 +52,18 @@ def chunk_indices_without_sync(
 
 
 def _patch_fla_chunk_indices() -> None:
-    """Troca o `prepare_chunk_indices` que o `chunk_gated_delta_rule` usa pelo `chunk_indices_without_sync`.
+    """Troca o `prepare_chunk_indices` do `chunk_gated_delta_rule` e da conv causal do FLA pelo `chunk_indices_without_sync`.
 
     Uma vez por processo. O resultado fica no `tensor_cache` do FLA (por identidade dos tensores),
     então as camadas GDN de um mesmo micro-batch, e o recompute do grad checkpoint, o calculam uma vez.
+    A conv (`gdn_fla_conv`) chama o mesmo `prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=...)`
+    do módulo `fla.modules.conv.triton.ops` (3 vezes por camada, q/k/v): sem a troca cada chamada
+    sincronizaria o stream; com a função cacheada compartilhada, o cálculo é um só por micro-batch.
     """
     global _fla_patched
     if _fla_patched:
         return
+    import fla.modules.conv.triton.ops as fla_conv_ops
     import fla.ops.gated_delta_rule.chunk as fla_chunk
     from fla.utils import tensor_cache
 
@@ -70,11 +74,17 @@ def _patch_fla_chunk_indices() -> None:
         return chunk_indices_without_sync(cu_seqlens, chunk_size, cu_seqlens_cpu, original=original)
 
     fla_chunk.prepare_chunk_indices = prepare_chunk_indices
+    fla_conv_ops.prepare_chunk_indices = prepare_chunk_indices
     _fla_patched = True
 
 
 class GatedDeltaNet(nn.Module):
     """`o_proj(RMSNorm(o) * silu(g_proj(x)))`, com `o` vindo do gated delta rule sobre q/k/v pós-conv.
+
+    No backend `fla` três opções do `ModelConfig` trocam trechos em PyTorch por kernels do FLA, sem mudar
+    pesos nem resultado (`gdn_kernel_gate`: decaimento e sigmoid(beta) no kernel do delta rule;
+    `gdn_fla_conv`: conv causal + SiLU do FLA; `fused_norm_gate`: RMSNorm·silu(gate) fundidos). O GVA é
+    nativo no `fla` (q/k com `gdn_qk_heads`, sem `repeat_interleave`); o backend `torch` repete as heads.
 
     `forward(x [B,T,D], cu_seqlens)`: com `cu_seqlens` (`[S+1]`, exige `B == 1`) a conv e o estado
     recorrente resetam em cada documento; sem ele, cada linha do batch é um documento.
@@ -89,6 +99,9 @@ class GatedDeltaNet(nn.Module):
         if cfg.gdn_backend not in ("fla", "torch"):
             raise ValueError(f"gdn_backend desconhecido: {cfg.gdn_backend!r}")
         self.backend = cfg.gdn_backend
+        self.kernel_gate = cfg.gdn_kernel_gate
+        self.fla_conv = cfg.gdn_fla_conv
+        self.fused_norm_gate = cfg.fused_norm_gate
         self.qk_heads = cfg.gdn_qk_heads
         self.v_heads = cfg.gdn_v_heads
         self.head_dim = cfg.gdn_head_dim
@@ -120,38 +133,77 @@ class GatedDeltaNet(nn.Module):
 
     def forward(self, x: Tensor, cu_seqlens: Tensor | None = None, cu_seqlens_cpu: Tensor | None = None) -> Tensor:
         b, t, _ = x.shape
-        doc_ids = None if cu_seqlens is None else doc_ids_from_cu_seqlens(cu_seqlens, t)
+        fla = self.backend == "fla"
+        if fla:
+            _patch_fla_chunk_indices()
+        # a conv do FLA lê o `cu_seqlens` direto; a nossa precisa do documento de cada token
+        doc_ids = None if cu_seqlens is None or self.fla_conv else doc_ids_from_cu_seqlens(cu_seqlens, t)
 
-        q = self._conv_silu(self.q_proj(x), self.conv_q, doc_ids).view(b, t, self.qk_heads, self.head_dim)
-        k = self._conv_silu(self.k_proj(x), self.conv_k, doc_ids).view(b, t, self.qk_heads, self.head_dim)
-        v = self._conv_silu(self.v_proj(x), self.conv_v, doc_ids).view(b, t, self.v_heads, self.head_dim)
-        rep = self.v_heads // self.qk_heads
-        if rep > 1:  # GVA: cada head de q/k atende `rep` heads de v consecutivas
-            q = q.repeat_interleave(rep, dim=2)
-            k = k.repeat_interleave(rep, dim=2)
+        def conv(h: Tensor, weight: Tensor) -> Tensor:
+            return self._conv_silu(h, weight, doc_ids, cu_seqlens, cu_seqlens_cpu)
 
-        # g (log do decaimento, <= 0) sempre em fp32; beta pode ficar no dtype da ativação
-        g = -self.A_log.float().exp() * F.softplus(self.a_proj(x).float() + self.dt_bias.float())
-        beta = self.b_proj(x).sigmoid()
+        q = conv(self.q_proj(x), self.conv_q).view(b, t, self.qk_heads, self.head_dim)
+        k = conv(self.k_proj(x), self.conv_k).view(b, t, self.qk_heads, self.head_dim)
+        v = conv(self.v_proj(x), self.conv_v).view(b, t, self.v_heads, self.head_dim)
         scale = self.head_dim**-0.5
 
-        if self.backend == "fla":
+        if fla:
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-            _patch_fla_chunk_indices()
+            # GVA nativo (D4): o kernel recebe q/k com `qk_heads` e v com `v_heads`; a head i de v usa a
+            # head i // (v_heads // qk_heads) de q/k, o mesmo agrupamento consecutivo do `repeat_interleave`
+            # do backend torch (provado pelo teste de paridade). Sem a cópia de q/k, a l2norm e os
+            # kernels de chunk leem `rep` vezes menos dados.
+            if self.kernel_gate:
+                # a_proj/b_proj crus: o kernel faz -exp(A_log)·softplus(a + dt_bias) (fp32) e sigmoid(b)
+                gate_kwargs = dict(
+                    use_gate_in_kernel=True, A_log=self.A_log, dt_bias=self.dt_bias, use_beta_sigmoid_in_kernel=True
+                )
+                g, beta = self.a_proj(x), self.b_proj(x)
+            else:
+                gate_kwargs = {}
+                g, beta = self._gate_and_beta(x)
             o, _ = chunk_gated_delta_rule(
                 q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=True, **gate_kwargs,
             )
         else:
+            rep = self.v_heads // self.qk_heads
+            if rep > 1:  # GVA: cada head de q/k atende `rep` heads de v consecutivas
+                q = q.repeat_interleave(rep, dim=2)
+                k = k.repeat_interleave(rep, dim=2)
+            g, beta = self._gate_and_beta(x)
             o = naive_gated_delta_rule(
                 F.normalize(q, dim=-1), F.normalize(k, dim=-1), v, g, beta, scale=scale, cu_seqlens=cu_seqlens
             )
 
-        gate = F.silu(self.g_proj(x)).view(b, t, self.v_heads, self.head_dim)
-        return self.o_proj((self.o_norm(o) * gate).flatten(-2))
+        gate = self.g_proj(x).view(b, t, self.v_heads, self.head_dim)
+        if self.fused_norm_gate:
+            from fla.modules.fused_norm_gate import rms_norm_gated
 
-    @staticmethod
-    def _conv_silu(h: Tensor, weight: Tensor, doc_ids: Tensor | None) -> Tensor:
+            # RMSNorm(o) * silu(gate) num kernel só (cálculo em fp32, um único arredondamento para o dtype
+            # de `o`); o funcional com `o_norm.weight` mantém o state_dict. Sem bias; eps do `o_norm`.
+            o = rms_norm_gated(o, gate, self.o_norm.weight, None, activation="swish", eps=self.o_norm.eps)
+        else:
+            o = self.o_norm(o) * F.silu(gate)
+        return self.o_proj(o.flatten(-2))
+
+    def _gate_and_beta(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        # g (log do decaimento, <= 0) sempre em fp32; beta pode ficar no dtype da ativação
+        g = -self.A_log.float().exp() * F.softplus(self.a_proj(x).float() + self.dt_bias.float())
+        return g, self.b_proj(x).sigmoid()
+
+    def _conv_silu(
+        self, h: Tensor, weight: Tensor, doc_ids: Tensor | None, cu_seqlens: Tensor | None, cu_seqlens_cpu: Tensor | None
+    ) -> Tensor:
+        if self.fla_conv:
+            from fla.modules.conv import causal_conv1d
+
+            # Mesma orientação da nossa: o kernel aplica `weight[:, K-1]` ao token atual (tap i_w + W - 1,
+            # i_w = 0) e zera o que vem antes do início de cada documento (`cu_seqlens`). O peso fp32 vai
+            # direto (o kernel o lê em fp32), sem o cast para o dtype da ativação da conv nossa.
+            return causal_conv1d(
+                h, weight, activation="silu", cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu
+            )[0]
         # peso fp32 convertido para o dtype da ativação: sob autocast bf16 a conv continua em bf16
         return F.silu(causal_conv1d_varlen(h, weight.to(h.dtype), doc_ids))

@@ -77,3 +77,19 @@ def test_get_preset_overrides_do_not_mutate_presets():
 def test_get_preset_unknown_name_lists_available():
     with pytest.raises(KeyError, match="tiny"):
         get_preset("nope")
+
+
+@pytest.mark.parametrize("flag", ["gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate"])
+def test_fla_only_options_reject_torch_backend(flag):
+    # as três opções usam kernels do FLA: com o backend torch seriam ignoradas em silêncio
+    with pytest.raises(ValueError, match=flag):
+        ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, gdn_backend="torch", **{flag: True})
+    cfg = ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, gdn_backend="fla", **{flag: True})
+    assert getattr(cfg, flag) is True
+    assert getattr(get_preset("tiny"), flag) is False  # tiny (torch) e os defaults ficam desligados
+
+
+@pytest.mark.parametrize("name", ["s150m", "b0_8"])
+def test_fla_presets_enable_gdn_path_options(name):
+    c = get_preset(name)
+    assert c.gdn_kernel_gate and c.gdn_fla_conv and c.fused_norm_gate
