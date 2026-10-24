@@ -275,6 +275,21 @@ def _packed_cuda_batch(n=512, cu_list=(0, 100, 230, 300, 420, 512)):
 
 
 @pytest.mark.cuda
+def test_mean_from_sum_is_bitwise_equal_to_int_divisor():
+    # R11: a loss média com a contagem em tensor tem de ser bit a bit a do divisor `int` da base
+    # (`total / max(n, 1)`), no valor e no gradiente em relação à soma; a divisão por tensor 0-dim difere no ulp
+    gen = torch.Generator().manual_seed(0)
+    counts = [0, 1, 2, 3, 7, 27, 100, 511, 4093] + torch.randint(1, 100_000, (300,), generator=gen).tolist()
+    for n in counts:
+        total = (torch.rand((), generator=gen) * 1000).cuda().requires_grad_()
+        ref = total / max(n, 1)
+        (ref_grad,) = torch.autograd.grad(ref, total)
+        new = lm_module._mean_from_sum(total, torch.tensor(n, device="cuda"))
+        (new_grad,) = torch.autograd.grad(new, total)
+        assert torch.equal(new, ref) and torch.equal(new_grad, ref_grad), n
+
+
+@pytest.mark.cuda
 @pytest.mark.fla
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype:UserWarning")
 @pytest.mark.parametrize("grad_checkpoint", [False, True], ids=["eager", "grad_ckpt"])

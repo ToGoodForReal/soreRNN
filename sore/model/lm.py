@@ -22,6 +22,17 @@ from sore.model.mtp import MTPModule, mtp_labels, next_token_embeddings
 from sore.model.residual import GatedHyperResidual, PlainResidual, StreamFinal, init_stream
 
 
+def _mean_from_sum(total: Tensor, count: Tensor) -> Tensor:
+    """`total / max(count, 1)` com `count` em tensor, sem ler o valor na CPU e bit a bit igual a `total / int`.
+
+    Com divisor `int` o PyTorch (CUDA) calcula `total * (1 / n)`; com um tensor 0-dim faria a divisão
+    verdadeira, que difere no último bit em parte dos casos (no valor e no gradiente). Multiplicar pelo
+    `reciprocal` reproduz a conta do divisor `int` e continua sem sincronizar. Sem tokens válidos a soma
+    é 0 e o `clamp` evita 0/0: loss 0.
+    """
+    return total * count.clamp(min=1).reciprocal()
+
+
 @dataclass
 class LMOutput:
     """`loss = lm_loss + mtp_weight * mtp_loss`, cada um a média sobre os seus tokens válidos.
@@ -165,14 +176,14 @@ class SoreLM(nn.Module):
         weight = self.head_weight
         chunk = self.cfg.loss_chunk_size
         lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), chunk, ce=self.chunk_ce)
-        lm_loss = lm_sum / n_tokens.clamp(min=1)  # sem tokens válidos a soma é 0: loss 0, não 0/0
+        lm_loss = _mean_from_sum(lm_sum, n_tokens)
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
             h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask, cu_seqlens_cpu)
             targets = mtp_labels(labels, cu_seqlens)
             mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), chunk, ce=self.chunk_ce)
-            mtp_loss = mtp_sum / n_mtp.clamp(min=1)
+            mtp_loss = _mean_from_sum(mtp_sum, n_mtp)
             loss = lm_loss + self.cfg.mtp_weight * mtp_loss
         return LMOutput(loss=loss, lm_loss=lm_loss, mtp_loss=mtp_loss, n_tokens=n_tokens)
 

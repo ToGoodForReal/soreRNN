@@ -21,6 +21,12 @@ from sore.model.varlen import doc_ids_from_cu_seqlens
 _DT_MIN, _DT_MAX = 1e-3, 1e-1
 _fla_patched = False
 
+# `chunk_indices_without_sync` é adaptada de flash-linear-attention 0.5.2, `fla/ops/utils/index.py`
+# (`_segmented_arange` e `prepare_chunk_indices`), licença MIT:
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+# A diferença: os índices saem da GPU (o total de chunks vem do `cu_seqlens_cpu`), sem a cópia
+# bloqueante final do original.
+
 
 def chunk_indices_without_sync(
     cu_seqlens: Tensor, chunk_size: int, cu_seqlens_cpu: Tensor | None = None, *, original=None
