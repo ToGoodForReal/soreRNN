@@ -235,3 +235,40 @@ execuções.
 No modo eager, com `--grad-accum 1`, cada passo de 2048 tokens gasta ~0,33 s no forward, ~0,87 s
 no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~20% do
 passo sem acúmulo.
+
+## 8. Amostra PT para testes
+
+Os portões de qualidade (A/B de perda em ~20M tokens) precisam de texto de verdade: o shard
+sintético de `make_synthetic_shard.py` é aprendido quase por completo. A amostra tem 3e8 tokens de
+mC4 português (`allenai/c4`, `multilingual/c4-pt*.json.gz`, ODC-BY), tokenizados com o tokenizer do
+Qwen3.5 e remapeados **provisoriamente** para 65.536 ids: EOS = 0, UNK = 1 e os 65.534 ids mais
+frequentes da amostra viram 2, 3, ... Não é o vocabulário definitivo do projeto.
+
+```bash
+uv run python scripts/make_text_sample.py --out data/sample_pt --n-tokens 3e8
+```
+
+Precisa de rede (baixa 3 arquivos de ~200 MB em `data/raw/`; leva ~4 min no WSL com 16 núcleos).
+Saída em `data/sample_pt/` (ignorada pelo git): `sample_000.bin`(+`.json`), `remap.npy`,
+`doc_lengths.json` (até 100.000 comprimentos de documento, com EOS, por reservoir sampling) e
+`meta.json`. Use `eos_id=0` no `PackedTokenStream` e `vocab_size=65536` no modelo. O
+`meta.json` da geração real (2026-10-24):
+
+```json
+{
+  "source_urls": [
+    ".../allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00000-of-01024.json.gz",
+    ".../allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00001-of-01024.json.gz",
+    ".../allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00002-of-01024.json.gz"
+  ],
+  "tokenizer_repo": "Qwen/Qwen3.5-0.8B",
+  "tokenizer_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "eos_old_id": 248044,
+  "n_tokens": 300000000,
+  "n_docs": 387560,
+  "unk_rate": 0.00193377
+}
+```
+
+O shard termina em EOS (o último documento é truncado para fechar em `n_tokens` exatos). Cerca de
+0,19% dos tokens caem em UNK.
