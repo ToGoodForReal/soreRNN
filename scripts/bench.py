@@ -1,16 +1,32 @@
 """Benchmark de throughput e memória de um passo de treino completo (fwd + bwd + otimizadores).
 
-Monta o preset na GPU (backends de GDN e atenção do próprio preset) e roda `--steps` passos sobre
-micro-batches empacotados sintéticos: `seq_len * micro_batch` tokens em `[1, N]`, com 4 documentos
-por janela (fronteiras sorteadas a cada passo, mesmo número de documentos para não mudar shapes).
-Cada passo é o do trainer: `--grad-accum` micro-batches (autocast bf16, forward com labels e
-backward), clip do grad norm e um passo do Muon + AdamW. O passo do otimizador (Newton-Schulz do
-Muon) pesa muito com `--grad-accum 1`; no treino real ele se dilui em 16-64 micro-batches. Mede a
-mediana de tok/s dos passos após o `--warmup`, o MFU via `flops_per_token` e o pico de VRAM
-(`torch.cuda.max_memory_allocated`).
+Monta o preset na GPU (backends de GDN e atenção do próprio preset, mais os `--override`) e roda
+`--steps` passos sobre micro-batches empacotados sintéticos: `seq_len * micro_batch` tokens em
+`[1, N]`. Sem `--doc-lengths`, cada janela tem 4 documentos (fronteiras sorteadas a cada passo, mesmo
+número de documentos para não mudar shapes). Com `--doc-lengths` (o `doc_lengths.json` da amostra PT),
+os comprimentos são sorteados dessa distribuição real, janela a janela (um documento nunca atravessa
+a janela), então o número de documentos varia entre micro-batches, como no treino.
+Cada passo é o do trainer: monta e copia os `--grad-accum` micro-batches (fase `data`), faz o
+forward com labels e o backward de cada um (autocast bf16, fase `fwd_bwd`), o clip do grad norm
+(`clip`) e um passo do Muon + AdamW (`optimizer`). O passo do otimizador (Newton-Schulz do Muon)
+pesa muito com `--grad-accum 1`; no treino real ele se dilui em 16-64 micro-batches. Mede a mediana
+de tok/s dos passos após o `--warmup` (o tempo do passo inclui a fase `data`), o MFU via
+`flops_per_token` e o pico de VRAM (`torch.cuda.max_memory_allocated`). As fases são medidas com
+eventos CUDA (mediana por passo, em segundos).
+
+`--profile` roda ainda dois passos extras, depois dos medidos e com os mesmos batches (o 1º aquece,
+o 2º fica sob o `torch.profiler`), e soma o tempo de GPU do 2º por categoria de kernel
+(`sore.train.profiling`), mais `idle`: a parede desse passo menos a união dos intervalos de kernels
+(a GPU esperando a CPU). O passo perfilado tem o overhead do profiler e não inclui a montagem do batch.
+
+`--no-cpu-cu-seqlens` ainda não faz nada: o modelo só passa a aceitar `cu_seqlens_cpu` na Task 4
+do plano de throughput, e o bench só passa esse argumento a partir de lá.
+
+`--out FILE.jsonl` acrescenta uma linha JSON por execução (a mesma do `--json`).
 
 Uso: uv run python scripts/bench.py --preset s150m --seq-len 2048 --micro-batch 1 --steps 10 \
-         --grad-checkpoint --peak-tflops 35 [--compile] [--grad-accum 1] [--warmup 2] [--json]
+         --grad-checkpoint --peak-tflops 35 [--compile] [--grad-accum 1] [--warmup 2] [--json] \
+         [--override n_layers=4] [--doc-lengths data/sample_pt/doc_lengths.json] [--profile] [--out F.jsonl]
 """
 from __future__ import annotations
 
@@ -19,46 +35,88 @@ import json
 import statistics
 import sys
 import time
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 
 from sore.model import SoreLM, get_preset
 from sore.model.flops import flops_per_token
 from sore.model.loss import IGNORE_INDEX
+from sore.train.config import parse_overrides
 from sore.train.optim import build_optimizers
+from sore.train.profiling import idle_seconds, kernel_breakdown
+from sore.train.text_sample import sample_doc_lengths
 from sore.train.trainer import compile_model
 
 DOCS_PER_WINDOW = 4
+PHASES = ("data", "fwd_bwd", "clip", "optimizer")
 
 
 def synthetic_batch(
-    seq_len: int, micro_batch: int, vocab: int, gen: torch.Generator
+    seq_len: int,
+    micro_batch: int,
+    vocab: int,
+    gen: torch.Generator,
+    doc_lengths: Sequence[int] | None = None,
+    rng: np.random.Generator | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """`input_ids` e `labels` `[1, N]` aleatórios e `cu_seqlens` com `DOCS_PER_WINDOW` documentos por janela."""
+    """`input_ids` e `labels` `[1, N]` aleatórios e o `cu_seqlens` dos documentos.
+
+    Sem `doc_lengths`, cada janela tem `DOCS_PER_WINDOW` documentos; com ele, os comprimentos de cada
+    janela vêm de `sample_doc_lengths(doc_lengths, seq_len, rng)` e o número de documentos varia.
+    """
     n = seq_len * micro_batch
     ids = torch.randint(0, vocab, (1, n), generator=gen)
     labels = torch.randint(0, vocab, (1, n), generator=gen)
-    n_cuts = min(DOCS_PER_WINDOW, seq_len) - 1
     cuts = [0]
     for w in range(micro_batch):
-        inner = (torch.randperm(seq_len - 1, generator=gen)[:n_cuts] + 1).sort().values  # em [1, seq_len)
-        cuts += (w * seq_len + inner).tolist() + [(w + 1) * seq_len]
+        if doc_lengths is None:
+            n_cuts = min(DOCS_PER_WINDOW, seq_len) - 1
+            inner = (torch.randperm(seq_len - 1, generator=gen)[:n_cuts] + 1).sort().values  # em [1, seq_len)
+            cuts += (w * seq_len + inner).tolist() + [(w + 1) * seq_len]
+        else:
+            assert rng is not None, "doc_lengths exige o gerador rng"
+            cuts += (w * seq_len + np.cumsum(sample_doc_lengths(doc_lengths, seq_len, rng))).tolist()
     cu_seqlens = torch.tensor(cuts, dtype=torch.long)
     labels[0, cu_seqlens[1:] - 1] = IGNORE_INDEX  # como no stream: a posição do EOS não tem alvo
     return ids, labels, cu_seqlens
 
 
-def train_step(model: SoreLM, optimizers: list[torch.optim.Optimizer], batches: list[tuple[Tensor, ...]]) -> None:
-    """Um passo do trainer: backward de cada micro-batch (loss / n), clip em 1.0 e passo dos otimizadores."""
+def train_step(
+    model: SoreLM,
+    optimizers: list[torch.optim.Optimizer],
+    make_batches: Callable[[], list[tuple[Tensor, ...]]],
+    device: torch.device,
+) -> tuple[float, dict[str, float]]:
+    """Um passo do trainer; devolve `(parede_s, fases_s)`.
+
+    Monta os micro-batches (`make_batches`, já na GPU), faz o backward de cada um (loss / n), o clip em
+    1.0 e o passo dos otimizadores. As fases `PHASES` saem de eventos CUDA gravados entre elas: com a
+    GPU esperando a CPU, o tempo ocioso entra na fase em que ocorreu (as fases somam a parede).
+    """
+    marks = [torch.cuda.Event(enable_timing=True) for _ in range(len(PHASES) + 1)]
+    torch.cuda.synchronize(device)
+    t0 = time.perf_counter()
+    marks[0].record()
+    batches = make_batches()
+    marks[1].record()
     for ids, labels, cu_seqlens in batches:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = model(ids, cu_seqlens=cu_seqlens, labels=labels)
         (out.loss / len(batches)).backward()
+    marks[2].record()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    marks[3].record()
     for opt in optimizers:
         opt.step()
         opt.zero_grad(set_to_none=True)
+    marks[4].record()
+    torch.cuda.synchronize(device)
+    wall = time.perf_counter() - t0
+    return wall, {p: marks[i].elapsed_time(marks[i + 1]) / 1e3 for i, p in enumerate(PHASES)}
 
 
 def main() -> None:
@@ -75,6 +133,19 @@ def main() -> None:
     parser.add_argument("--grad-checkpoint", action="store_true", help="activation checkpointing por bloco")
     parser.add_argument("--peak-tflops", type=float, default=165.0, help="pico BF16 denso da GPU (4090: 165)")
     parser.add_argument("--json", action="store_true", help="imprime também o resultado em JSON")
+    parser.add_argument(
+        "--override", action="append", default=[], metavar="KEY=VALUE",
+        help="campo do ModelConfig do preset, valor em YAML (repetível); `--override n_layers=4` é a fatia do b0_8",
+    )
+    parser.add_argument(
+        "--doc-lengths", type=Path, help="doc_lengths.json da amostra PT: sorteia os comprimentos de documento dele"
+    )
+    parser.add_argument(
+        "--no-cpu-cu-seqlens", action="store_true",
+        help="(sem efeito até a Task 4) não passa o cu_seqlens_cpu ao modelo",
+    )
+    parser.add_argument("--profile", action="store_true", help="um passo extra no torch.profiler: tempo por categoria de kernel")
+    parser.add_argument("--out", type=Path, help="acrescenta o resultado, em uma linha JSON, a este arquivo .jsonl")
     args = parser.parse_args()
     if min(args.seq_len, args.micro_batch, args.grad_accum) < 1 or args.peak_tflops <= 0:
         parser.error("--seq-len, --micro-batch, --grad-accum e --peak-tflops devem ser positivos")
@@ -82,10 +153,15 @@ def main() -> None:
         parser.error("exige 0 <= --warmup < --steps")
     if not torch.cuda.is_available():
         parser.error("o benchmark exige GPU CUDA")
+    try:
+        overrides = parse_overrides(args.override)
+        cfg = get_preset(args.preset, **{"grad_checkpoint": args.grad_checkpoint, **overrides})
+    except (ValueError, KeyError, TypeError) as e:
+        parser.error(f"--preset/--override inválido: {e}")
+    doc_lengths = json.loads(args.doc_lengths.read_text())["lengths"] if args.doc_lengths else None
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    cfg = get_preset(args.preset, grad_checkpoint=args.grad_checkpoint)
     model = SoreLM(cfg).to(device)
     optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
     if args.compile:
@@ -94,33 +170,43 @@ def main() -> None:
     tokens = args.seq_len * args.micro_batch * args.grad_accum  # por passo
     print(
         f"[bench] {args.preset}: {model.num_params() / 1e6:.1f}M params | {flops / 1e9:.2f} GFLOP/token | "
-        f"gdn={cfg.gdn_backend} attn={cfg.attn_backend} | {torch.cuda.get_device_name(device)}",
+        f"gdn={cfg.gdn_backend} attn={cfg.attn_backend} | {torch.cuda.get_device_name(device)}"
+        + (f" | overrides {overrides}" if overrides else "")
+        + (f" | doc-lengths {args.doc_lengths}" if args.doc_lengths else ""),
         flush=True,
     )
 
     gen = torch.Generator().manual_seed(0)
-    times: list[float] = []
-    for step in range(args.steps):
-        batches = [
-            tuple(t.to(device) for t in synthetic_batch(args.seq_len, args.micro_batch, cfg.vocab_size, gen))
+    doc_rng = np.random.default_rng(0)
+
+    def make_batches() -> list[tuple[Tensor, ...]]:
+        return [
+            tuple(
+                t.to(device)
+                for t in synthetic_batch(args.seq_len, args.micro_batch, cfg.vocab_size, gen, doc_lengths, doc_rng)
+            )
             for _ in range(args.grad_accum)
         ]
-        torch.cuda.synchronize(device)
-        t0 = time.perf_counter()
+
+    times: list[float] = []
+    phases: list[dict[str, float]] = []
+    for step in range(args.steps):
         try:
-            train_step(model, optimizers, batches)
-            torch.cuda.synchronize(device)
+            wall, step_phases = train_step(model, optimizers, make_batches, device)
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
             print(f"[bench] OOM no passo {step + 1}: pico alocado {peak:.2f} GB", flush=True)
             sys.exit(1)
-        times.append(time.perf_counter() - t0)
-        print(f"  passo {step + 1}/{args.steps}: {times[-1]:.3f} s ({tokens / times[-1]:,.0f} tok/s)", flush=True)
+        times.append(wall)
+        phases.append(step_phases)
+        print(f"  passo {step + 1}/{args.steps}: {wall:.3f} s ({tokens / wall:,.0f} tok/s)", flush=True)
 
     step_s = statistics.median(times[args.warmup :])
     tok_s = tokens / step_s
     result = {
         "preset": args.preset,
+        "overrides": overrides,
+        "doc_lengths": str(args.doc_lengths) if args.doc_lengths else None,
         "seq_len": args.seq_len,
         "micro_batch": args.micro_batch,
         "grad_accum": args.grad_accum,
@@ -135,7 +221,19 @@ def main() -> None:
         "mfu": flops * tok_s / (args.peak_tflops * 1e12),
         "mem_gb": torch.cuda.max_memory_allocated(device) / 1e9,
         "mem_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9,
+        "phases": {p: statistics.median(s[p] for s in phases[args.warmup :]) for p in PHASES},
     }
+    if args.profile:
+        # Os mesmos batches duas vezes: um micro-batch com formato inédito (por exemplo, janela de 1
+        # documento só) recompila os Blocks na hora, e esse passo viraria só "idle". O 1º passo
+        # (sem profiler) aquece, o 2º é o perfilado; por isso a fase `data` dele é desprezível.
+        fixed = make_batches()
+        train_step(model, optimizers, lambda: fixed, device)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            prof_wall, _ = train_step(model, optimizers, lambda: fixed, device)
+        result["kernels"] = {**kernel_breakdown(prof), "idle": idle_seconds(prof, prof_wall)}
     print(
         f"[bench] {args.preset} seq {args.seq_len} x mb {args.micro_batch} x accum {args.grad_accum} | "
         f"compile={'on' if args.compile else 'off'} ckpt={'on' if args.grad_checkpoint else 'off'} | "
@@ -144,8 +242,19 @@ def main() -> None:
         f"VRAM pico {result['mem_gb']:.2f} GB (reservado {result['mem_reserved_gb']:.2f} GB)",
         flush=True,
     )
+    print("[bench] fases (s/passo): " + " | ".join(f"{p} {v:.3f}" for p, v in result["phases"].items()), flush=True)
+    if args.profile:
+        print(
+            f"[bench] GPU por categoria no passo perfilado ({prof_wall:.3f} s): "
+            + " | ".join(f"{c} {v:.3f} s ({v / prof_wall:.0%})" for c, v in result["kernels"].items()),
+            flush=True,
+        )
     if args.json:
         print(json.dumps(result))
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("a") as f:
+            f.write(json.dumps(result) + "\n")
 
 
 if __name__ == "__main__":

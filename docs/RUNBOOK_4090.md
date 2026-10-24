@@ -236,6 +236,57 @@ No modo eager, com `--grad-accum 1`, cada passo de 2048 tokens gasta ~0,33 s no 
 no backward (com recomputação), ~0,30 s no Muon e ~0,02 s no AdamW. Por isso o Muon pesa ~20% do
 passo sem acúmulo.
 
+### Linha de base do plano de throughput (bench v2, 2026-10-24)
+
+Ponto de partida das tasks do plano de throughput (`docs/superpowers/plans/2026-10-24-perf-mfu.md`),
+medido na 3050 com o `scripts/bench.py` v2: comprimentos de documento sorteados de
+`data/sample_pt/doc_lengths.json` (a amostra PT; o nº de documentos varia entre micro-batches), seq
+2048 × micro_batch 1, `--grad-accum 2 --grad-checkpoint --compile`, 10 passos com 2 de warmup
+(mediana dos 8 restantes), `--peak-tflops 35`. O comando, trocando `<preset>`:
+
+```bash
+uv run python scripts/bench.py --preset <preset> --seq-len 2048 --micro-batch 1 --grad-accum 2 --steps 10 --warmup 2 \
+    --grad-checkpoint --compile --doc-lengths data/sample_pt/doc_lengths.json --profile --peak-tflops 35 \
+    --out runs/perf-mfu/baseline_3050.jsonl
+```
+
+O `b0_8` aqui é uma **fatia**: `--preset b0_8 --override n_layers=4` (221,4M parâmetros, 1,87
+GFLOP/token a 2048), porque o modelo inteiro não cabe em 6 GB. Serve para comparar alavancas entre
+si na 3050, não para prever o tok/s da 4090. O tempo do passo (e o tok/s) do bench v2 inclui a fase
+`data` (montagem do batch + cópia H2D), como o passo do trainer; as fases saem de eventos CUDA.
+
+| Configuração | tok/s | MFU | VRAM pico (alocado / reservado) | data | fwd_bwd | clip | optimizer |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `s150m` (164,3M) | 3.036 | 11,7% | 2,99 / 3,34 GB | 0,006 s | 1,055 s | 0,019 s | 0,282 s |
+| fatia do `b0_8` (`n_layers=4`) | 2.616 | 14,0% | 4,06 / 4,64 GB | 0,006 s | 1,136 s | 0,024 s | 0,431 s |
+
+Fases em segundos por passo (2 × 2048 tokens), mediana dos passos medidos. O MFU do `s150m` oscila
+~10% entre execuções (a GPU de notebook esquenta; as execuções de calibração deram 2.970–3.097 tok/s).
+
+Tempo de GPU por categoria de kernel (`--profile`: um passo extra, perfilado, com os mesmos batches de
+um passo de aquecimento; `idle` é a parede do passo menos a união dos intervalos de kernels). O
+profiler custa ~15–20% de parede (1,53 s e 1,90 s contra 1,35 s e 1,57 s sem ele), então vale a
+proporção entre categorias, não o valor absoluto:
+
+| Categoria | `s150m` | fatia do `b0_8` |
+|---|---:|---:|
+| matmul (cuBLAS/CUTLASS, mm do Inductor) | 0,876 s (57%) | 1,284 s (68%) |
+| elementwise (Inductor `triton_poi/red/per`, ATen pontual/redução, Muon/AdamW) | 0,413 s (27%) | 0,453 s (24%) |
+| gdn (kernels do FLA) | 0,125 s (8%) | 0,069 s (4%) |
+| loss (CE: `log_softmax`/`nll_loss`) | 0,044 s (3%) | 0,043 s (2%) |
+| attention (flex) | 0,026 s (2%) | 0,023 s (1%) |
+| other (memcpy/memset, scan/sort do `cu_seqlens`) | 0,003 s (0%) | 0,004 s (0%) |
+| idle (GPU parada) | 0,047 s (3%) | 0,025 s (1%) |
+| parede do passo perfilado | 1,534 s | 1,901 s |
+
+Leituras: na 3050 a GPU não fica esperando a CPU (`idle` ≤ 3%), então o ganho está em kernels, não em
+lançamento; o matmul domina (57–68%), e o `optimizer` (Muon) pesa 21–28% do passo com `--grad-accum 2`
+(no treino real ele se dilui em 16–64 micro-batches). As categorias vêm de `sore/train/profiling.py`
+(tabela `_RULES`, montada com nomes reais de kernel capturados nesta máquina; estenda-a ali).
+Uma janela com **um só** documento (`cu_seqlens` com 2 entradas) faz o Dynamo recompilar os Blocks
+(especialização do tamanho 2, guarda `3 <= cu_seqlens.size()[0]`) na primeira vez que aparece; por
+isso o bench perfila um passo com batches já executados.
+
 ## 8. Amostra PT para testes
 
 Os portões de qualidade (A/B de perda em ~20M tokens) precisam de texto de verdade: o shard

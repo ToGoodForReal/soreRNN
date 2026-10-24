@@ -27,6 +27,9 @@ packages = ["sore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/ não tem __init__.py e há test_config.py em tests/model e tests/train: o modo padrão
+# (prepend) levanta "import file mismatch" por causa do basename repetido
+addopts = ["--import-mode=importlib"]
 markers = [
     "cuda: exige GPU CUDA (pulado automaticamente sem GPU)",
     "fla: exige GPU CUDA e flash-linear-attention (pulado automaticamente sem eles)",

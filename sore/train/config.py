@@ -169,6 +169,43 @@ def load_train_config(path: Path) -> TrainConfig:
     return TrainConfig(**raw)
 
 
+def _parse_value(text: str) -> Any:
+    """`yaml.safe_load` do valor; string que o `float()` aceita como literal numérico vira float.
+
+    O PyYAML (YAML 1.1) devolve `3e-3` e `35e9` como string; aqui eles viram número, como nos
+    campos do `TrainConfig`. "nan"/"inf"/"infinity" (qualquer caixa) continuam strings: `float()`
+    os aceita, mas ninguém quer um override numérico que seja NaN sem querer.
+    """
+    value = yaml.safe_load(text)
+    if isinstance(value, str) and value.strip().lower().lstrip("+-") not in ("nan", "inf", "infinity"):
+        try:
+            return float(value)
+        except ValueError:
+            pass
+    return value
+
+
+def parse_overrides(pairs: list[str]) -> dict[str, Any]:
+    """`["a=1", "b.c=true"]` -> `{"a": 1, "b": {"c": True}}` (flags `--override KEY=VALUE`).
+
+    O valor é lido como YAML (`true`, `4`, `[1, 2]`, `null`); chave com ponto vira dict aninhado,
+    o formato do `model_overrides`. Par sem `=` levanta ValueError.
+    """
+    out: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, text = pair.partition("=")
+        if not sep or not key:
+            raise ValueError(f"override inválido {pair!r}: esperado KEY=VALUE")
+        node = out
+        *parents, leaf = key.split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"override {pair!r} conflita com um valor escalar já dado para {part!r}")
+        node[leaf] = _parse_value(text)
+    return out
+
+
 def resolve_data_paths(patterns: list[str]) -> list[Path]:
     """Expande cada padrão com `sorted(glob)` (ordem determinística dos shards), na ordem dada."""
     paths: list[Path] = []
