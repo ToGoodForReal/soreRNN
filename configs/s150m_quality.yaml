@@ -1,0 +1,18 @@
+# Portão de qualidade das alavancas de velocidade: s150m, 2e7 tokens de texto PT real
+# (`data/sample_pt`, ver RUNBOOK_4090.md §8). Rodado por scripts/run_quality_gates.sh, que sobrescreve
+# `out_dir` e `seed` com --set. Cabe numa 3050 de 8 GB (micro_batch 2 a 2048).
+model_preset: s150m
+data_paths: ["data/sample_pt/*.bin"]
+eos_id: 0
+
+# 2048 x 2 x 16 = 65.536 tokens por passo -> 305 passos
+grad_accum: 16
+stages:
+  - {until_tokens: 2e7, seq_len: 2048, micro_batch: 2}
+total_tokens: 2e7
+
+warmup_steps: 30
+decay_frac: 0.2
+ckpt_every_tokens: 5e6
+compile: true
+out_dir: runs/quality/ref_s0

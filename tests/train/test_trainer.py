@@ -15,6 +15,7 @@ import sore.model.lm as lm_module
 import sore.train.trainer as trainer_module
 from sore.model import get_preset
 from sore.model.flops import flops_per_token
+from sore.train.__main__ import main as cli_main
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
 from sore.train.data import write_token_shard
 from sore.train.schedule import wsd_multiplier
@@ -615,6 +616,7 @@ def test_load_train_config_rejects_invalid(tmp_path, stages, total, extra, match
     [
         ("tiny_local.yaml", "tiny", 512, 2),
         ("s150m_ablation.yaml", "s150m", 131_072, 2),
+        ("s150m_quality.yaml", "s150m", 65_536, 1),
         ("b0_8_pretrain.yaml", "b0_8", 524_288, 2),
     ],
 )
@@ -641,3 +643,37 @@ def test_resolve_data_paths(tmp_path):
     assert resolve_data_paths([str(tmp_path / "*.bin")]) == [tmp_path / "a.bin", tmp_path / "b.bin"]
     with pytest.raises(FileNotFoundError, match="nada"):
         resolve_data_paths([str(tmp_path / "*.bin"), str(tmp_path / "missing*.bin")])
+
+
+# --- CLI (`--set`) -----------------------------------------------------------------------------
+
+
+def test_cli_set_merges_model_overrides(tmp_path, monkeypatch):
+    yaml_path = _yaml(tmp_path, extra="model_overrides: {grad_checkpoint: true}\n")
+    got = {}
+    monkeypatch.setattr("sore.train.__main__.train", lambda cfg, **kw: got.update(cfg=cfg, **kw))
+    cli_main(["--config", str(yaml_path), "--set", "model_overrides.fused_ce=true", "--set", "seed=3",
+              "--max-steps", "0"])
+    assert got["cfg"].model_overrides == {"grad_checkpoint": True, "fused_ce": True}  # merge, não substitui
+    assert got["cfg"].seed == 3 and got["max_steps"] == 0
+
+
+def test_cli_set_unknown_key_still_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr("sore.train.__main__.train", lambda cfg, **kw: None)
+    with pytest.raises(ValueError, match="desconhecidas"):
+        cli_main(["--config", str(_yaml(tmp_path)), "--set", "nao_existe=1"])
+
+
+def test_cli_set_replaces_stages(tmp_path, monkeypatch):
+    got = {}
+    monkeypatch.setattr("sore.train.__main__.train", lambda cfg, **kw: got.update(cfg=cfg))
+    cli_main(["--config", str(_yaml(tmp_path)), "--set", "total_tokens=2e5",
+              "--set", "stages=[{until_tokens: 2e5, seq_len: 2048, micro_batch: 2}]"])
+    assert got["cfg"].total_tokens == 200_000 and got["cfg"].stages == [Stage(200_000, 2048, 2)]
+
+
+def test_quality_config_values():
+    cfg = load_train_config(REPO / "configs" / "s150m_quality.yaml")
+    assert cfg.total_steps == 305 and cfg.stages == [Stage(20_000_000, 2048, 2)]
+    assert (cfg.warmup_steps, cfg.decay_frac, cfg.ckpt_every_tokens, cfg.compile) == (30, 0.2, 5_000_000, True)
+    assert cfg.data_paths == ["data/sample_pt/*.bin"] and cfg.eos_id == 0 and cfg.out_dir == "runs/quality/ref_s0"

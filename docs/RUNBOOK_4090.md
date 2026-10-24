@@ -323,3 +323,101 @@ Saída em `data/sample_pt/` (ignorada pelo git): `sample_000.bin`(+`.json`), `re
 
 O shard termina em EOS (o último documento é truncado para fechar em `n_tokens` exatos). Cerca de
 0,19% dos tokens caem em UNK.
+
+## 9. Segunda máquina (desktop)
+
+Os portões de qualidade (seção 10) rodam num desktop Linux com uma RTX 3050 8GB, enquanto a 4090
+fica livre. O desktop só treina; não precisa de rede para os testes, só para o `uv sync` inicial.
+
+**1. Levar o código.** Preferido: `git bundle`, que não exige push nem credenciais.
+
+```bash
+# na máquina principal (na raiz do repo)
+git bundle create sorernn.bundle feat/perf-mfu
+# copie para o desktop (scp, pendrive, ...); no desktop:
+git clone -b feat/perf-mfu sorernn.bundle soreRNN
+# atualizações: na principal, só os commits novos desde o último sha que o desktop tem
+git bundle create update.bundle <sha-antigo>..feat/perf-mfu
+# no desktop (dentro do repo): git pull ../update.bundle feat/perf-mfu
+```
+
+A alternativa é um `git push` da branch para um remoto que o desktop alcance; o push só acontece se
+**o usuário** o autorizar (o plano e os agentes nunca empurram sozinhos).
+
+**2. Levar a amostra PT** (seção 8; `data/` não vai para o git). Duas opções:
+- Copiar: `rsync -avP data/sample_pt/ desktop:soreRNN/data/sample_pt/`. O treino só lê
+  `sample_000.bin` e o sidecar `sample_000.json`; o resto (`remap.npy`, `doc_lengths.json`, `meta.json`)
+  é documentação. É a opção segura: os bytes são idênticos.
+- Regenerar no desktop (precisa de rede, ~4 min):
+  `uv run python scripts/make_text_sample.py --out data/sample_pt --n-tokens 3e8 --revision 2fc06364715b967f1860aea9cf38778875588b17`.
+  O `--revision` fixa o tokenizer (o `tokenizer_revision` do `meta.json`). Os dados são os 3 primeiros
+  arquivos `c4-pt.tfrecord-0000{0,1,2}-of-01024.json.gz` do `allenai/c4` na revisão
+  `1588ec454efa1a09f29cd18ddd04fe05fc8653a2` (as `source_urls` do `meta.json`), mas o script resolve o
+  `main` do dataset no momento da execução. Se o `main` andou, confira o resultado:
+  `sha256sum data/sample_pt/sample_000.bin` tem de bater com o da máquina principal. Se não bater, copie.
+
+**3. Preparar o ambiente.**
+
+```bash
+bash scripts/setup_worker.sh --check   # só valida: driver com CUDA >= 13.0, uv, amostra, ambiente sincronizado
+bash scripts/setup_worker.sh           # instala o uv se faltar, `uv sync --frozen` e `pytest -m "cuda or fla"`
+```
+
+O `--check` não instala nada e sai com 1 e uma mensagem se algo faltar. Sem `--check`, o script
+instala o `uv` com o instalador oficial (`curl -LsSf https://astral.sh/uv/install.sh | sh`) e roda os
+testes `@cuda`/`@fla`, que têm de executar, não ser pulados. Aceita o formato novo do `nvidia-smi`
+("CUDA UMD Version: 13.4") e o antigo ("CUDA Version: 13.4").
+
+## 10. Campanha de qualidade
+
+Toda alavanca de velocidade **exata** (que não deveria mudar a matemática) precisa de uma corrida
+curta no `s150m` (`configs/s150m_quality.yaml`: 2e7 tokens de texto PT real, 305 passos de 65.536
+tokens, `compile: true`) comparada com duas referências. Uma alavanca **com perda** só é aceita se a
+configuração exata ficar abaixo de 15.000 tok/s.
+
+| Regra | Passa se |
+|---|---|
+| Exata | `abs(gap) <= max(ruído, 0,5%)`, com `gap = (cand - ref) / ref` e `ruído = abs(ref_s1 - ref_s0) / ref_s0` |
+| Com perda | `gap <= 1%` (só para cima: perda menor sempre passa) |
+
+A perda é a média do `lm_loss` nos últimos 10% dos passos (`ceil(0,1 × n)` valores não nulos do
+`metrics.jsonl`; passos pulados não contam).
+
+```bash
+tmux new -s quality
+bash scripts/run_quality_gates.sh              # todas as corridas de RUNS, depois a tabela
+bash scripts/run_quality_gates.sh --only ref_s0
+```
+
+- Cada corrida grava em `runs/quality/NOME`. Uma corrida que já terminou (`last.pt` e o último passo
+  no `metrics.jsonl`) é pulada; uma interrompida é retomada de `last.pt`. Basta rodar o mesmo comando
+  de novo depois de uma queda.
+- `ref_s0` (seed 0) e `ref_s1` (seed 1) rodam com todas as alavancas da lista **desligadas**
+  (`ALL_OFF` no topo do script). A comparação final só sai com as duas referências terminadas; o
+  `compare_runs.py` imprime uma tabela markdown (perda final, gap, limiar, PASSA/REPROVA) e sai com 1
+  se alguma candidata reprova.
+- Na 3050 de 8GB o `micro_batch` 2 a 2048 deve caber. Se estourar a memória, use
+  `EXTRA_SET="model_overrides.grad_checkpoint=true"` em **todas** as corridas, refs incluídas
+  (apague `runs/quality` antes, para não misturar configurações).
+
+**Como uma task de alavanca entra.** No `scripts/run_quality_gates.sh`: (1) acrescente a flag
+"desligada" da alavanca a `ALL_OFF` (um `KEY=VALUE` por elemento, vale para todas as corridas);
+(2) acrescente a linha `NOME:override` ligada em `RUNS`, por exemplo
+`"fused_ce:model_overrides.fused_ce=true"`. As overrides de uma linha ficam depois de `ALL_OFF` e
+vencem. Várias overrides numa linha ou no `EXTRA_SET` se separam por `;`. Alavanca com perda: o
+nome também vai em `LOSSY`. Mude `ALL_OFF` e as referências já rodadas passam a ser de outra
+configuração: apague `runs/quality/ref_s*` e rode de novo.
+
+**Ensaio curto (valida o encanamento, não a qualidade; na 3050 do notebook leva ~5 min, quase tudo é o `torch.compile`).**
+
+```bash
+EXTRA_SET="total_tokens=2e5;warmup_steps=1;stages=[{until_tokens: 2e5, seq_len: 2048, micro_batch: 2}]" \
+  bash scripts/run_quality_gates.sh --only ref_s0
+```
+
+`EXTRA_SET` vale para todas as corridas, separado por `;` (os valores têm espaços e vírgulas). O
+`warmup_steps=1` é necessário: com 3 passos o warmup de 30 passos passaria do início do decay. Com
+`--set` direto: `python -m sore.train --config configs/s150m_quality.yaml --set seed=1 --set model_overrides.fused_ce=true`;
+`model_overrides.X` faz merge com o `model_overrides` do YAML, e chave desconhecida continua dando erro.
+Apague `runs/quality/` depois do ensaio: a corrida curta deixa um `last.pt` que a campanha real
+retomaria como se fosse dela (o passo final difere, então não é pulada, mas é continuada).

@@ -156,9 +156,30 @@ class TrainConfig:
         return asdict(self)
 
 
-def load_train_config(path: Path) -> TrainConfig:
-    """Lê o YAML e valida (ValueError em chave desconhecida ou estágios inconsistentes)."""
+def _merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Aplica `overrides` sobre `base`: dict com dict faz merge recursivo, o resto substitui.
+
+    O merge é o que deixa `model_overrides.fused_ce=true` somar ao `model_overrides` do YAML em vez
+    de apagá-lo; listas (como `stages`) são substituídas inteiras.
+    """
+    out = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_train_config(path: Path, overrides: dict[str, Any] | None = None) -> TrainConfig:
+    """Lê o YAML, aplica `overrides` (de `parse_overrides`) e valida.
+
+    As overrides entram no dict cru, antes da validação: chave desconhecida continua dando
+    ValueError. ValueError também em estágios inconsistentes.
+    """
     raw = yaml.safe_load(Path(path).read_text()) or {}
+    if overrides:
+        raw = _merge(raw, overrides)
     known = {f.name for f in fields(TrainConfig)}
     required = {f.name for f in fields(TrainConfig) if f.default is MISSING and f.default_factory is MISSING}
     unknown, missing = set(raw) - known, required - set(raw)
