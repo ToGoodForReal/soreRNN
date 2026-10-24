@@ -363,9 +363,11 @@ bash scripts/setup_worker.sh --check   # só valida: driver com CUDA >= 13.0, uv
 bash scripts/setup_worker.sh           # instala o uv se faltar, `uv sync --frozen` e `pytest -m "cuda or fla"`
 ```
 
-O `--check` não instala nada e sai com 1 e uma mensagem se algo faltar. Sem `--check`, o script
+O `--check` não instala nada e sai com 1 e uma mensagem se algo faltar (inclusive se
+`torch.cuda.is_available()` for falso ou o `fla` não importar). Sem `--check`, o script
 instala o `uv` com o instalador oficial (`curl -LsSf https://astral.sh/uv/install.sh | sh`) e roda os
-testes `@cuda`/`@fla`, que têm de executar, não ser pulados. Aceita o formato novo do `nvidia-smi`
+testes `@cuda`/`@fla`, que têm de executar: o pytest sai com 0 quando tudo é pulado, então o script
+falha se houver qualquer teste pulado ou nenhum executado. Aceita o formato novo do `nvidia-smi`
 ("CUDA UMD Version: 13.4") e o antigo ("CUDA Version: 13.4").
 
 ## 10. Campanha de qualidade

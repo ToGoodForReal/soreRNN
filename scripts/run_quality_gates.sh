@@ -82,30 +82,45 @@ for entry in "${RUNS[@]}"; do
   sets=(); for s in "${ARGS[@]}"; do sets+=(--set "$s"); done
   if finished "$OUT" "$STEPS"; then
     echo "[quality] $NAME: já terminou ($STEPS passos), pulando"
-  elif [[ -f "$OUT/last.pt" ]]; then
-    echo "[quality] $NAME: retomando de $OUT/last.pt"
-    uv run python -m sore.train --config "$CONFIG" "${sets[@]}" --resume "$OUT/last.pt"
   else
-    echo "[quality] $NAME: treinando ($STEPS passos)"
-    uv run python -m sore.train --config "$CONFIG" "${sets[@]}"
+    if [[ -f "$OUT/last.pt" ]]; then
+      echo "[quality] $NAME: retomando de $OUT/last.pt"
+      uv run python -m sore.train --config "$CONFIG" "${sets[@]}" --resume "$OUT/last.pt"
+    else
+      echo "[quality] $NAME: treinando ($STEPS passos)"
+      uv run python -m sore.train --config "$CONFIG" "${sets[@]}"
+    fi
+    # o treino sair com 0 não prova que chegou ao fim (SIGINT/SIGTERM param na fronteira do passo e
+    # saem com 0): sem isso uma candidata incompleta sumiria da tabela e a alavanca pareceria aprovada
+    finished "$OUT" "$STEPS" || {
+      echo "[quality] ERRO: corrida $NAME não terminou (último passo != $STEPS em $OUT); rode de novo para retomar" >&2
+      exit 1
+    }
   fi
   ran+=("$NAME")
 done
 [[ ${#ran[@]} -gt 0 ]] || { echo "[quality] nenhuma corrida chamada '$ONLY' em RUNS" >&2; exit 2; }
 
 # comparação: só com as duas referências terminadas (parciais dariam um ruído enganoso);
-# candidatas = as demais corridas terminadas
+# candidatas = as demais corridas terminadas. Uma corrida pedida (todas, ou a do --only) que não
+# terminou nunca é pulada em silêncio: o script falha.
 cands=(); refs_done=0
 for entry in "${RUNS[@]}"; do
   prepare "$entry"
-  finished "$OUT" "$STEPS" || continue
+  if ! finished "$OUT" "$STEPS"; then
+    if [[ -z "$ONLY" || "$ONLY" == "$NAME" ]]; then
+      echo "[quality] ERRO: corrida $NAME não terminou" >&2
+      exit 1
+    fi
+    continue  # fora do --only: não foi pedida nesta chamada
+  fi
   case "$NAME" in
     ref_s0|ref_s1) refs_done=$((refs_done + 1)) ;;
     *) cands+=("$OUT") ;;
   esac
 done
 if [[ $refs_done -lt 2 ]]; then
-  echo "[quality] ref_s0 e ref_s1 ainda não terminaram: comparação adiada"
+  echo "[quality] ref_s0 e ref_s1 ainda não terminaram: comparação adiada (sem veredito)"
   exit 0
 fi
 lossy=(); for name in "${LOSSY[@]}"; do lossy+=(--lossy "$name"); done
