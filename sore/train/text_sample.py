@@ -16,6 +16,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
@@ -31,6 +32,7 @@ MAX_DOC_LENGTHS = 100_000  # tamanho do reservoir de comprimentos de documento
 _FLUSH_TOKENS = 4_000_000  # tokens acumulados antes de gravar/contar (bincount por doc seria lento)
 _REMAP_CHUNK = 16_000_000
 _ENCODE_BATCH = 512
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def build_remap(counts: np.ndarray, eos_old_id: int, vocab_size: int = SAMPLE_VOCAB) -> np.ndarray:
@@ -195,12 +197,24 @@ def generate_sample(
 
 
 def resolve_revision(repo: str, revision: str, kind: str = "models") -> str:
-    """Resolve `revision` para o sha do commit via API do HF Hub (fallback: a própria string)."""
-    try:
-        with urllib.request.urlopen(f"https://huggingface.co/api/{kind}/{repo}/revision/{revision}", timeout=60) as r:
-            return json.load(r)["sha"]
-    except Exception:  # rede/API fora do ar: a string recebida ainda identifica o que foi pedido
+    """Resolve `revision` para o sha do commit via API do HF Hub.
+
+    Um sha de 40 hex já é imutável e passa direto, sem rede. Qualquer outra referência ("main", tag)
+    exige a API: se ela falhar, levanta `RuntimeError` em vez de cair de volta na string recebida,
+    pois um "main" gravado no meta.json (e na chave do cache dos brutos) quebraria a reprodutibilidade
+    sem aviso.
+    """
+    if _SHA_RE.fullmatch(revision):
         return revision
+    url = f"https://huggingface.co/api/{kind}/{repo}/revision/{revision}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            return json.load(r)["sha"]
+    except Exception as e:
+        raise RuntimeError(
+            f"não foi possível resolver {repo}@{revision} para um sha ({url}): {e!r}. "
+            "Passe --revision com o sha de 40 caracteres ou restabeleça a rede."
+        ) from e
 
 
 def download(url: str, dest: Path) -> Path:

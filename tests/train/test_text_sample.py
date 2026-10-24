@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -14,6 +15,7 @@ from sore.train.text_sample import (
     UNK_ID,
     build_remap,
     generate_sample,
+    resolve_revision,
     sample_doc_lengths,
     tokenize_docs,
 )
@@ -66,6 +68,24 @@ def test_sample_end_to_end(tmp_path):
     stream = PackedTokenStream([shard], seq_len=4, micro_batch=2, eos_id=0, seed=0)
     batch = next(iter(stream))
     assert batch is not None
+
+
+def test_resolve_revision_failure_is_not_silent(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("sem rede")
+
+    monkeypatch.setattr("sore.train.text_sample.urllib.request.urlopen", boom)
+    with pytest.raises(RuntimeError, match="Qwen/Qwen3.5-0.8B@main"):
+        resolve_revision("Qwen/Qwen3.5-0.8B", "main")
+
+
+def test_resolve_revision_full_sha_skips_the_network(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("não deveria chamar a rede")
+
+    monkeypatch.setattr("sore.train.text_sample.urllib.request.urlopen", boom)
+    sha = "2fc06364715b967f1860aea9cf38778875588b17"
+    assert resolve_revision("Qwen/Qwen3.5-0.8B", sha) == sha
 
 
 def test_generate_sample_truncates_exactly_and_ends_in_eos(tmp_path):
