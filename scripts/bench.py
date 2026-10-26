@@ -57,6 +57,29 @@ DOCS_PER_WINDOW = 4
 PHASES = ("data", "fwd_bwd", "clip", "optimizer")
 
 
+def write_oom_record(
+    out_path: Path | None,
+    preset: str,
+    overrides: dict,
+    seq_len: int,
+    micro_batch: int,
+    peak_tflops: float,
+) -> None:
+    """Grava uma linha JSON de OOM em `--out` antes de encerrar o benchmark (R9)."""
+    if out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "oom": True,
+            "preset": preset,
+            "overrides": overrides,
+            "seq_len": seq_len,
+            "micro_batch": micro_batch,
+            "peak_tflops": peak_tflops,
+        }
+        with out_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
 def synthetic_batch(
     seq_len: int,
     micro_batch: int,
@@ -172,12 +195,18 @@ def main() -> None:
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    model = SoreLM(cfg).to(device)
-    if args.fp8 != "off":
-        apply_fp8(model, args.fp8, emulate=args.fp8_emulate)
-    optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
-    if args.compile:
-        compile_model(model, mode=args.compile_mode)  # in-place, por Block
+    try:
+        model = SoreLM(cfg).to(device)
+        if args.fp8 != "off":
+            apply_fp8(model, args.fp8, emulate=args.fp8_emulate)
+        optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
+        if args.compile:
+            compile_model(model, mode=args.compile_mode)  # in-place, por Block
+    except torch.OutOfMemoryError:
+        peak = torch.cuda.max_memory_allocated(device) / 1e9 if torch.cuda.is_available() else 0.0
+        print(f"[bench] OOM na inicialização do modelo: pico alocado {peak:.2f} GB", flush=True)
+        write_oom_record(args.out, args.preset, overrides, args.seq_len, args.micro_batch, args.peak_tflops)
+        sys.exit(1)
     flops = flops_per_token(cfg, args.seq_len)
     tokens = args.seq_len * args.micro_batch * args.grad_accum  # por passo
     print(
@@ -211,6 +240,7 @@ def main() -> None:
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
             print(f"[bench] OOM no passo {step + 1}: pico alocado {peak:.2f} GB", flush=True)
+            write_oom_record(args.out, args.preset, overrides, args.seq_len, args.micro_batch, args.peak_tflops)
             sys.exit(1)
         times.append(wall)
         phases.append(step_phases)
@@ -246,13 +276,19 @@ def main() -> None:
         # Os mesmos batches duas vezes: um micro-batch com formato inédito (por exemplo, janela de 1
         # documento só) recompila os Blocks na hora, e esse passo viraria só "idle". O 1º passo
         # (sem profiler) aquece, o 2º é o perfilado; por isso a fase `data` dele é desprezível.
-        fixed = make_batches()
-        train_step(model, optimizers, lambda: fixed, device)
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as prof:
-            prof_wall, _ = train_step(model, optimizers, lambda: fixed, device)
-        result["kernels"] = {**kernel_breakdown(prof), "idle": idle_seconds(prof, prof_wall)}
+        try:
+            fixed = make_batches()
+            train_step(model, optimizers, lambda: fixed, device)
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                prof_wall, _ = train_step(model, optimizers, lambda: fixed, device)
+            result["kernels"] = {**kernel_breakdown(prof), "idle": idle_seconds(prof, prof_wall)}
+        except torch.OutOfMemoryError:
+            peak = torch.cuda.max_memory_allocated(device) / 1e9
+            print(f"[bench] OOM durante profiling: pico alocado {peak:.2f} GB", flush=True)
+            write_oom_record(args.out, args.preset, overrides, args.seq_len, args.micro_batch, args.peak_tflops)
+            sys.exit(1)
     print(
         f"[bench] {args.preset} seq {args.seq_len} x mb {args.micro_batch} x accum {args.grad_accum} | "
         f"compile={'on' if args.compile else 'off'} ckpt={'on' if args.grad_checkpoint else 'off'} | "

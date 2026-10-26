@@ -1,0 +1,21 @@
+# A/B de FP8 no b0_8: referência em bf16 (3e8 tokens, estágio 4096x2).
+# Mesmos dados e seed da candidata FP8.
+# A melhor configuração exata (fused_ce, gdn_path, checkpoint_policy/frac) é passada via --set.
+model_preset: b0_8
+model_overrides: {grad_checkpoint: true}
+data_paths: ["data/sample_pt/*.bin"]
+eos_id: 0
+
+# 4096 x 2 x 64 = 524.288 tokens por passo -> ~572 passos (~5,5 h a 15k tok/s)
+grad_accum: 64
+stages:
+  - {until_tokens: 3e8, seq_len: 4096, micro_batch: 2}
+total_tokens: 3e8
+
+warmup_steps: 100
+decay_frac: 0.2
+ckpt_every_tokens: 5e7
+compile: true
+seed: 0
+fp8: "off"
+out_dir: runs/fp8_ab/bf16

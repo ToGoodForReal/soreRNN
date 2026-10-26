@@ -465,3 +465,77 @@ uv run python scripts/bench.py --preset b0_8 --seq-len 4096 --micro-batch 2 --gr
 uv run python scripts/bench.py --preset b0_8 --seq-len 4096 --micro-batch 2 --grad-accum 16 --steps 6 --compile --grad-checkpoint --fp8 rowwise
 ```
 
+## 12. Protocolo de Dia 1 na RTX 4090
+
+Este protocolo estabelece o roteiro passo a passo para o primeiro dia de operação na RTX 4090 física,
+desde a validação do ambiente até a escolha e consolidação da configuração final de pré-treino do `b0_8`.
+
+### 12.1 Definição do MFU (incluindo corridas FP8)
+
+O MFU (*Model Flops Utilization*) é calculado rigorosamente como:
+
+$$\text{MFU} = \frac{\text{flops\_per\_token}(\text{cfg}, \text{seq\_len}) \times \text{tok/s}}{\text{pico\_flops}}$$
+
+- Na RTX 4090, o pico considerado é **sempre o pico BF16 denso de 165 TFLOPS**, **inclusive nas corridas com FP8**.
+- **Justificativa metodológica:** manter a base de 165 TFLOPS em todas as corridas (BF16 e FP8) garante uma métrica uniforme e diretamente proporcional ao throughput real. O ganho de velocidade proporcionado pelo tensor core FP8 se traduz em um MFU nominalmente maior (por exemplo, superando 50%), permitindo comparação direta de custo-benefício em relação à meta de 15.000 tok/s.
+
+### 12.2 Passos de Operação do Dia 1
+
+Execute os 7 passos numerados na ordem abaixo:
+
+1. **Validação do hardware e driver:**
+   ```bash
+   nvidia-smi
+   ```
+   Confirme que o driver NVIDIA reporta suporte a CUDA ≥ 13.0 (driver ≥ 580 no Linux), que a GPU é a RTX 4090 (24 GB de VRAM) e que não há processos concorrentes consumindo memória ou computação.
+
+2. **Sincronização do ambiente:**
+   ```bash
+   uv sync
+   ```
+   Instala as versões travadas no `uv.lock`: `torch==2.14.1` (cu130), `triton==3.8.0`, `flash-linear-attention==0.5.2`, `torchao==0.18.0`.
+
+3. **Verificação da suíte de testes:**
+   ```bash
+   uv run pytest -q
+   ```
+   Confirme que toda a suíte passa. Na 4090 (arquitetura Ada Lovelace, sm89), os testes com marcador `@fp8` (ex: `test_fp8_real_smoke`) **devem executar e passar**, sem nenhum skip por falta de hardware nativo.
+
+4. **Execução da matriz de benchmark do Dia 1:**
+   ```bash
+   bash scripts/day1_bench.sh
+   ```
+   O script executa automaticamente a matriz no `b0_8` para os dois estágios de contexto (`8192x1` e `4096x2`), com `--grad-accum 8 --steps 6 --warmup 2 --doc-lengths data/sample_pt/doc_lengths.json`:
+   - Linha de base (todas as alavancas desligadas, checkpoint `full`, com profiling);
+   - Cada alavanca exata isolada (`fused_ce`, `gdn_path`, `ckpt_selective`, `ckpt_ffn`);
+   - Todas as alavancas exatas juntas;
+   - Todas as exatas $\times$ políticas de checkpoint (`full`, `selective`, `ffn`) $\times$ `checkpoint_frac` {1.0, 0.5, 0.25};
+   - A melhor configuração exata com profiling e $\times$ FP8 (`tensorwise` e `rowwise`).
+   Todos os resultados e eventuais OOMs são registrados em `runs/day1/bench.jsonl`.
+
+5. **Sumarização e inspeção do throughput:**
+   ```bash
+   uv run python scripts/summarize_bench.py runs/day1/bench.jsonl
+   ```
+   Analise a tabela Markdown gerada:
+   - Verifique quais configurações atingem a **meta de 15.000 tok/s** (MFU ≥ 50%);
+   - Verifique que as configurações candidatas respeitam o **piso de 11.800 tok/s** e mantêm consumo de VRAM alocada $\le 22$ GB;
+   - Identifique a melhor configuração puramente exata.
+
+6. **Decisão sobre FP8 e validação de qualidade (se necessário):**
+   - **Se a melhor configuração exata atingir $\ge 15.000$ tok/s:** O FP8 **não** é utilizado. O pré-treino segue exclusivamente com as otimizações exatas.
+   - **Se a melhor configuração exata ficar $< 15.000$ tok/s:** O FP8 está autorizado a ser avaliado. Execute o portão de qualidade A/B de 3e8 tokens:
+     ```bash
+     uv run python -m sore.train --config configs/b0_8_fp8_ab_bf16.yaml
+     uv run python -m sore.train --config configs/b0_8_fp8_ab_fp8.yaml
+     ```
+     Em seguida, compare as perdas finais com `compare_runs.py` no modo lossy:
+     ```bash
+     uv run python scripts/compare_runs.py --ref runs/fp8_ab/bf16 --ref2 runs/fp8_ab/bf16 runs/fp8_ab/fp8 --lossy fp8
+     ```
+     **Critério de aprovação (spec §3):** $\text{loss final (FP8)} \le 1{,}01 \times \text{loss final (BF16)}$ (degradação máxima tolerada de 1%).
+
+7. **Consolidação na configuração de pré-treino:**
+   Grave os hiperparâmetros e overrides da configuração vencedora em `configs/b0_8_pretrain.yaml` (ajustando `model_overrides`, `fp8` se aplicável, etc.) e anote os números medidos (tok/s, MFU, pico de VRAM) na documentação do runbook antes de disparar o treino final de 50B tokens.
+
+
