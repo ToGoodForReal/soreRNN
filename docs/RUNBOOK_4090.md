@@ -524,11 +524,16 @@ Execute os 7 passos numerados na ordem abaixo:
 
 6. **Decisão sobre FP8 e validação de qualidade (se necessário):**
    - **Se a melhor configuração exata atingir $\ge 15.000$ tok/s:** O FP8 **não** é utilizado. O pré-treino segue exclusivamente com as otimizações exatas.
-   - **Se a melhor configuração exata ficar $< 15.000$ tok/s:** O FP8 está autorizado a ser avaliado. Execute o portão de qualidade A/B de 3e8 tokens:
+   - **Se a melhor configuração exata ficar $< 15.000$ tok/s:** O FP8 está autorizado a ser avaliado. Execute o portão de qualidade A/B de 3e8 tokens aplicando a melhor configuração exata medida em ambos os treinos via `--set`:
      ```bash
-     uv run python -m sore.train --config configs/b0_8_fp8_ab_bf16.yaml
-     uv run python -m sore.train --config configs/b0_8_fp8_ab_fp8.yaml
+     # Exemplo: se a melhor configuração exata no benchmark usou selective checkpoint com frac 0.5
+     uv run python -m sore.train --config configs/b0_8_fp8_ab_bf16.yaml \
+         --set model_overrides='{checkpoint_policy: selective, checkpoint_frac: 0.5}'
+     uv run python -m sore.train --config configs/b0_8_fp8_ab_fp8.yaml \
+         --set model_overrides='{checkpoint_policy: selective, checkpoint_frac: 0.5}'
      ```
+     *(Nota: chaves individuais também podem ser passadas pontualmente, ex: `--set model_overrides.checkpoint_policy=selective --set model_overrides.checkpoint_frac=0.5`; e caso a receita vencedora do FP8 no benchmark tenha sido `tensorwise`, sobrescreva com `--set fp8=tensorwise`)*.
+
      Em seguida, compare as perdas finais com `compare_runs.py` no modo lossy:
      ```bash
      uv run python scripts/compare_runs.py --ref runs/fp8_ab/bf16 --ref2 runs/fp8_ab/bf16 runs/fp8_ab/fp8 --lossy fp8
@@ -536,6 +541,6 @@ Execute os 7 passos numerados na ordem abaixo:
      **Critério de aprovação (spec §3):** $\text{loss final (FP8)} \le 1{,}01 \times \text{loss final (BF16)}$ (degradação máxima tolerada de 1%).
 
 7. **Consolidação na configuração de pré-treino:**
-   Grave os hiperparâmetros e overrides da configuração vencedora em `configs/b0_8_pretrain.yaml` (ajustando `model_overrides`, `fp8` se aplicável, etc.) e anote os números medidos (tok/s, MFU, pico de VRAM) na documentação do runbook antes de disparar o treino final de 50B tokens.
+   Grave os hiperparâmetros e overrides da configuração vencedora em `configs/b0_8_pretrain.yaml` (ajustando `model_overrides`, por exemplo `model_overrides: {grad_checkpoint: true, checkpoint_policy: selective, checkpoint_frac: 0.5}`, e `fp8` se aprovado no A/B) e anote os números medidos (tok/s, MFU, pico de VRAM) na documentação do runbook antes de disparar o treino final de 50B tokens.
 
 

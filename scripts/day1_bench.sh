@@ -167,7 +167,7 @@ for SEQ in $SEQS; do
     # 5. A melhor configuração exata x --profile e x fp8 {tensorwise, rowwise}
     echo ""
     echo "--- 5. Melhor configuração exata para seq_len=$SEQ_LEN, micro_batch=$MB ---"
-    BEST_CMD=$(python3 scripts/summarize_bench.py "$BENCH_JSONL" --best-exact "$SEQ_LEN" "$MB")
+    BEST_CMD=$(uv run python scripts/summarize_bench.py "$BENCH_JSONL" --best-exact "$SEQ_LEN" "$MB")
 
     if [ -n "$BEST_CMD" ]; then
         echo "Melhor exata encontrada: $BEST_CMD"
