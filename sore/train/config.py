@@ -98,6 +98,8 @@ class TrainConfig:
     # Execução (`out_dir` é o diretório do run: metrics.jsonl, last.pt e os snapshots ficam nele)
     compile: bool = False
     compile_mode: str | None = None
+    fp8: str = "off"  # "off", "tensorwise" ou "rowwise"
+    fp8_emulate: bool = False  # para testes e emulação em hardware sem FP8 nativo
     log_every: int = 10
     ckpt_every_tokens: int
     snapshot_every_tokens: int = 0  # snapshot_step{passo}.pt numerado a cada N tokens; 0 = desligado
@@ -118,6 +120,8 @@ class TrainConfig:
         self._validate()
 
     def _validate(self) -> None:
+        if self.fp8 not in ("off", "tensorwise", "rowwise"):
+            raise ValueError(f"fp8 deve ser um de ('off', 'tensorwise', 'rowwise'), recebeu {self.fp8!r}")
         if not self.stages:
             raise ValueError("é preciso ao menos um estágio em `stages`")
         if self.grad_accum < 1 or self.log_every < 1 or self.ckpt_every_tokens < 1:

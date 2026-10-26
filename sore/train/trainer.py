@@ -35,6 +35,7 @@ from sore.model.loss import IGNORE_INDEX
 from sore.train.checkpoint import load_checkpoint, save_checkpoint
 from sore.train.config import Stage, TrainConfig, resolve_data_paths
 from sore.train.data import PackedTokenStream
+from sore.train.fp8 import apply_fp8
 from sore.train.optim import apply_config_hparams, build_optimizers
 from sore.train.schedule import linear_schedule, wsd_multiplier
 
@@ -265,6 +266,8 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     model = SoreLM(get_preset(cfg.model_preset, **cfg.model_overrides)).to(device)
+    if cfg.fp8 != "off":
+        apply_fp8(model, cfg.fp8, emulate=cfg.fp8_emulate)
     optimizers = build_optimizers(model, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay)
     if cfg.compile:
         compile_model(model, mode=cfg.compile_mode)  # in-place, por Block: os nomes dos parâmetros não mudam

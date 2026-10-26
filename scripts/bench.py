@@ -47,6 +47,7 @@ from sore.model import SoreLM, get_preset
 from sore.model.flops import flops_per_token
 from sore.model.loss import IGNORE_INDEX
 from sore.train.config import parse_overrides
+from sore.train.fp8 import apply_fp8
 from sore.train.optim import build_optimizers
 from sore.train.profiling import idle_seconds, kernel_breakdown
 from sore.train.text_sample import sample_doc_lengths
@@ -133,6 +134,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2, help="passos iniciais fora da mediana")
     parser.add_argument("--compile", action="store_true", help="torch.compile por Block (compile_model, como o trainer)")
     parser.add_argument("--compile-mode", default=None, help="modo de torch.compile (ex: max-autotune-no-cudagraphs)")
+    parser.add_argument("--fp8", choices=["off", "tensorwise", "rowwise"], default="off", help="FP8 via torchao (off, tensorwise, rowwise)")
+    parser.add_argument("--fp8-emulate", action="store_true", help="emula FP8 para teste em GPU < sm89")
     parser.add_argument("--grad-checkpoint", action="store_true", help="activation checkpointing por bloco")
     parser.add_argument("--peak-tflops", type=float, default=165.0, help="pico BF16 denso da GPU (4090: 165)")
     parser.add_argument("--json", action="store_true", help="imprime também o resultado em JSON")
@@ -170,6 +173,8 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(0)
     model = SoreLM(cfg).to(device)
+    if args.fp8 != "off":
+        apply_fp8(model, args.fp8, emulate=args.fp8_emulate)
     optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
     if args.compile:
         compile_model(model, mode=args.compile_mode)  # in-place, por Block
@@ -223,6 +228,8 @@ def main() -> None:
         "grad_accum": args.grad_accum,
         "compile": args.compile,
         "compile_mode": args.compile_mode,
+        "fp8": args.fp8,
+        "fp8_emulate": args.fp8_emulate,
         "grad_checkpoint": args.grad_checkpoint,
         "steps": args.steps,
         "warmup": args.warmup,

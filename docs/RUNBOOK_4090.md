@@ -423,3 +423,45 @@ EXTRA_SET="total_tokens=2e5;warmup_steps=1;stages=[{until_tokens: 2e5, seq_len: 
 `model_overrides.X` faz merge com o `model_overrides` do YAML, e chave desconhecida continua dando erro.
 Apague `runs/quality/` depois do ensaio: a corrida curta deixa um `last.pt` que a campanha real
 retomaria como se fosse dela (o passo final difere, então não é pulada, mas é continuada).
+
+## 11. Treino FP8 via torchao (alavanca G)
+
+O FP8 é uma **alavanca com perda** (spec §3): fica desligado por padrão (`fp8: "off"`) e só entra
+se a melhor configuração exata na RTX 4090 ficar abaixo de 15.000 tok/s (meta de MFU ≥ 50%),
+com o gate de loss final ≤ 1% pior que a referência em bf16.
+
+### 11.1 Configuração e receitas
+
+No YAML de treino (`TrainConfig`):
+
+```yaml
+fp8: "rowwise"          # "off" (padrão), "tensorwise" ou "rowwise"
+fp8_emulate: false      # true apenas para validação em GPUs < sm89 (ex: RTX 3050)
+```
+
+- `"tensorwise"`: escala dinâmica por tensor (cuBLAS). Opção mais rápida.
+- `"rowwise"`: escala dinâmica por linha (CUTLASS) com e4m3 e potências de 2. Mais precisa.
+- **Escopo do filtro:** converte apenas matrizes `nn.Linear` grandes sob `blocks.` e `mtp.`
+  com `in_features` e `out_features` múltiplos de 16, fora de `res_mixer`/`res_ffn`. Projeções
+  pequenas como `a_proj` e `b_proj` (saída `v_heads`), embedding e cabeça de LM ficam sempre em
+  alta precisão.
+- **Contrato de checkpoint:** `apply_fp8` preserva os nomes dos parâmetros e as chaves do
+  `state_dict`. Checkpoints salvos com FP8 podem ser retomados com FP8 desligado e vice-versa.
+- **Ordem de inicialização:** modelo → `apply_fp8` → `build_optimizers` → `compile_model`.
+
+### 11.2 Requisitos de hardware e recusa explícita
+
+- FP8 nativo exige arquitetura NVIDIA Ada Lovelace ou Hopper (capacidade CUDA ≥ 8.9, como a RTX 4090).
+- Em hardware com capacidade inferior (ex: RTX 3050 sm86), pedir `fp8: "tensorwise"` ou `"rowwise"`
+  sem `fp8_emulate: true` levanta imediatamente `RuntimeError` com mensagem explicativa contendo `"FP8"`.
+
+### 11.3 Benchmark de FP8 na 4090
+
+Para medir o impacto de FP8 no throughput e no consumo de memória:
+
+```bash
+# Comparação bf16 vs rowwise no estágio 4K
+uv run python scripts/bench.py --preset b0_8 --seq-len 4096 --micro-batch 2 --grad-accum 16 --steps 6 --compile --grad-checkpoint
+uv run python scripts/bench.py --preset b0_8 --seq-len 4096 --micro-batch 2 --grad-accum 16 --steps 6 --compile --grad-checkpoint --fp8 rowwise
+```
+
