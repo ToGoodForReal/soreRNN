@@ -524,6 +524,22 @@ def test_compile_model_compiles_each_block_in_place(monkeypatch):
     assert [n for n, _ in model.named_parameters()] == names  # divisão Muon/AdamW intacta
 
 
+def test_compile_model_skips_chunk_ce_with_fused_ce(monkeypatch):
+    seen = []
+
+    def fake_compile(fn, *args, **kwargs):
+        seen.append(fn.__self__)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    cfg = get_preset("tiny", gdn_backend="fla", attn_backend="flex", fused_ce=True)
+    model = lm_module.SoreLM(cfg)
+    assert compile_model(model) is model
+    # chunk_ce NÃO é compilado quando fused_ce=True (kernel customizado do Triton no FLA)
+    assert model.chunk_ce not in seen
+    assert seen == [*model.blocks, model.mtp.block]
+
+
 def test_compile_disables_mix_order_reduction(tmp_path, monkeypatch):
     # torch 2.14.1: o Inductor quebra no backward com mix_order_reduction ligado; o trainer desliga
     # antes de compilar. torch.compile é trocado por identidade (teste barato, sem compilar nada).

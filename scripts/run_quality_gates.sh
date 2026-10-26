@@ -26,6 +26,7 @@ ALL_OFF=(
   "model_overrides.gdn_kernel_gate=false"
   "model_overrides.gdn_fla_conv=false"
   "model_overrides.fused_norm_gate=false"
+  "model_overrides.fused_ce=false"
 )
 
 # PONTO DE EXTENSÃO 2: as corridas, `NOME:override;override;...` (separador `;`, pois valores como
@@ -36,6 +37,7 @@ RUNS=(
   "ref_s0:seed=0"
   "ref_s1:seed=1"
   "gdn_path:model_overrides.gdn_kernel_gate=true;model_overrides.gdn_fla_conv=true;model_overrides.fused_norm_gate=true"
+  "fused_ce:model_overrides.fused_ce=true"
 )
 
 # PONTO DE EXTENSÃO 3: nomes de candidatas COM perda (gap <= 1%); só vale se a exata ficar < 15k tok/s.

@@ -114,7 +114,9 @@ def compile_model(model: SoreLM) -> SoreLM:
     import torch._inductor.config as inductor_config
 
     inductor_config.triton.mix_order_reduction = False
-    modules = [*model.blocks, *([model.mtp.block] if model.mtp is not None else []), model.chunk_ce]
+    modules = [*model.blocks, *([model.mtp.block] if model.mtp is not None else [])]
+    if not model.cfg.fused_ce:
+        modules.append(model.chunk_ce)
     for module in modules:
         module.compile(dynamic=False)
     return model

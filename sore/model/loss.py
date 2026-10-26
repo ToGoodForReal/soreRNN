@@ -51,3 +51,36 @@ def chunked_lm_loss(
         end = start + chunk_size
         total = total + checkpoint(ce, hidden[start:end], weight, labels[start:end], use_reentrant=False)
     return total, (labels != IGNORE_INDEX).sum()
+
+
+def fused_lm_loss(hidden: Tensor, weight: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
+    """Soma da cross-entropy (fp32) e número de tokens válidos (`labels != -100`) via kernel fundido do FLA.
+
+    Fundindo o linear final com a cross-entropy em chunks internos no kernel Triton, os logits
+    `N x V` nunca são materializados em memória global (nem no forward, nem no backward). Segue o
+    mesmo contrato de `chunked_lm_loss`: soma fp32 0-dim e contagem int64 0-dim no device de `labels`.
+    Sob autocast, `hidden` e `weight` são convertidos para o mesmo dtype de autocast, com acumulação
+    de gradientes do peso em fp32. Sem tokens válidos a soma é zero conectada ao grafo (gradiente nulo).
+    """
+    from fla.modules.fused_linear_cross_entropy import fused_linear_cross_entropy_loss
+
+    device_type = "cuda" if hidden.is_cuda else "cpu"
+    if torch.is_autocast_enabled(device_type):
+        autocast_dtype = torch.get_autocast_dtype(device_type)
+        if hidden.dtype != autocast_dtype:
+            hidden = hidden.to(autocast_dtype)
+        if weight.dtype != autocast_dtype:
+            weight = weight.to(autocast_dtype)
+    elif hidden.dtype != weight.dtype:
+        weight = weight.to(hidden.dtype)
+
+    total = fused_linear_cross_entropy_loss(
+        hidden,
+        labels,
+        weight,
+        ignore_index=IGNORE_INDEX,
+        reduction="sum",
+        accumulate_grad_in_fp32=True,
+    )
+    return total, (labels != IGNORE_INDEX).sum()
+

@@ -1,8 +1,9 @@
-"""Testes da loss de LM em chunks (`chunked_lm_loss`)."""
+"""Testes da loss de LM em chunks (`chunked_lm_loss`) e fundida do FLA (`fused_lm_loss`)."""
+import pytest
 import torch
 import torch.nn.functional as F
 
-from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss
+from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss, fused_lm_loss
 
 N, D, V = 50, 16, 37
 
@@ -80,3 +81,79 @@ def test_chunked_does_not_save_logits():
     # em chunks nada do tamanho de logits fica guardado: o backward recalcula cada chunk
     chunked = _saved_shapes(lambda: chunked_lm_loss(hidden, weight, labels, chunk_size=7))
     assert not [s for s in chunked if len(s) == 2 and s[1] == V], chunked
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_fused_ce_matches_chunked():
+    # hidden [1000, 64], weight [512, 64], 13% dos labels -100
+    g = torch.Generator(device="cuda").manual_seed(42)
+    h_fp32 = torch.randn(1000, 64, device="cuda", generator=g)
+    w_fp32 = torch.randn(512, 64, device="cuda", generator=g)
+    labels = torch.randint(0, 512, (1000,), device="cuda", generator=g)
+    labels[torch.rand(1000, generator=g, device="cuda") < 0.13] = -100
+
+    # 1. Em fp32: soma com rel 1e-4, gradientes de hidden e weight com rel 2e-3
+    h_chunk = h_fp32.clone().requires_grad_()
+    w_chunk = w_fp32.clone().requires_grad_()
+    h_fused = h_fp32.clone().requires_grad_()
+    w_fused = w_fp32.clone().requires_grad_()
+
+    loss_c, count_c = chunked_lm_loss(h_chunk, w_chunk, labels)
+    loss_f, count_f = fused_lm_loss(h_fused, w_fused, labels)
+
+    assert count_f.dim() == 0 and count_f.dtype == torch.long and count_f.device == labels.device
+    assert torch.equal(count_f, count_c)
+    assert loss_f.dim() == 0 and loss_f.dtype == torch.float32
+
+    torch.testing.assert_close(loss_f, loss_c, rtol=1e-4, atol=0)
+
+    loss_c.backward()
+    loss_f.backward()
+
+    # atol cobre valores muito próximos de zero nos gradientes onde erro relativo não se aplica
+    atol_h = 1e-3 * h_chunk.grad.abs().max().item()
+    atol_w = 1e-3 * w_chunk.grad.abs().max().item()
+    torch.testing.assert_close(h_fused.grad, h_chunk.grad, rtol=2e-3, atol=atol_h)
+    torch.testing.assert_close(w_fused.grad, w_chunk.grad, rtol=2e-3, atol=atol_w)
+
+    # 2. Sob autocast bf16: rel 2e-2
+    h_chunk = h_fp32.clone().requires_grad_()
+    w_chunk = w_fp32.clone().requires_grad_()
+    h_fused = h_fp32.clone().requires_grad_()
+    w_fused = w_fp32.clone().requires_grad_()
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss_c_bf16, count_c_bf16 = chunked_lm_loss(h_chunk, w_chunk, labels)
+        loss_f_bf16, count_f_bf16 = fused_lm_loss(h_fused, w_fused, labels)
+
+    assert torch.equal(count_f_bf16, count_c_bf16)
+    torch.testing.assert_close(loss_f_bf16, loss_c_bf16, rtol=2e-2, atol=0)
+
+    loss_c_bf16.backward()
+    loss_f_bf16.backward()
+
+    atol_h_bf16 = 2e-3 * h_chunk.grad.abs().max().item()
+    atol_w_bf16 = 2e-3 * w_chunk.grad.abs().max().item()
+    torch.testing.assert_close(h_fused.grad, h_chunk.grad, rtol=2e-2, atol=atol_h_bf16)
+    torch.testing.assert_close(w_fused.grad, w_chunk.grad, rtol=2e-2, atol=atol_w_bf16)
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_fused_ce_all_ignored():
+    # todos os labels -100 -> soma 0, contagem 0, gradientes zerados e finitos (Review Focus 2)
+    h = torch.randn(50, 16, device="cuda", requires_grad=True)
+    w = torch.randn(32, 16, device="cuda", requires_grad=True)
+    labels = torch.full((50,), -100, dtype=torch.long, device="cuda")
+
+    loss_sum, n_valid = fused_lm_loss(h, w, labels)
+    assert isinstance(n_valid, torch.Tensor) and n_valid.dtype == torch.long and n_valid.dim() == 0
+    assert n_valid.item() == 0
+    assert loss_sum.dim() == 0 and loss_sum.dtype == torch.float32
+    assert loss_sum.item() == 0.0 and loss_sum.requires_grad
+
+    loss_sum.backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all() and not h.grad.any()
+    assert w.grad is not None and torch.isfinite(w.grad).all() and not w.grad.any()
+

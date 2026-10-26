@@ -18,7 +18,7 @@ from sore.model import SoreLM
 # `mtp_weight` entra aqui porque o trainer usa o λ do TrainConfig (R23), não o do modelo.
 _EXECUTION_FIELDS = (
     "gdn_backend", "attn_backend", "grad_checkpoint", "mtp_weight", "loss_chunk_size",
-    "gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate",
+    "gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate", "fused_ce",
 )
 
 

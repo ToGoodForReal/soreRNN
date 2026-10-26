@@ -430,3 +430,84 @@ def test_param_counts():
     assert b0_8.num_params() - b0_8.num_params(exclude_embedding=True) == vd
     assert b0_8_untied.num_params() == b0_8.num_params() + vd
     assert b0_8_untied.num_params(exclude_embedding=True) == b0_8.num_params(exclude_embedding=True)
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_lm_fused_ce_matches_default():
+    cfg_default = get_preset("tiny", gdn_backend="fla", attn_backend="flex", mtp_layers=1, fused_ce=False)
+    cfg_fused = get_preset("tiny", gdn_backend="fla", attn_backend="flex", mtp_layers=1, fused_ce=True)
+
+    torch.manual_seed(0)
+    m_default = SoreLM(cfg_default).cuda()
+    m_fused = SoreLM(cfg_fused).cuda()
+    m_fused.load_state_dict(m_default.state_dict())
+
+    # Lote com 2 documentos: doc 1 de 15 tokens (índices 0..14), doc 2 de 15 tokens (15..29)
+    # A última posição do doc 1 (índice 14) é -100 no LM.
+    # No MTP, mtp_labels atribui:
+    #   posição 13 -> alvo de 14 (que é -100)
+    #   posição 14 -> -100 (fim do doc)
+    # Portanto, o doc 1 tem a última posição -100 no LM e as duas últimas no MTP.
+    ids = torch.randint(0, cfg_default.vocab_size, (1, 30), device="cuda", generator=torch.Generator(device="cuda").manual_seed(1))
+    cu_seqlens = torch.tensor([0, 15, 30], device="cuda", dtype=torch.long)
+    labels = ids.clone()
+    labels[0, 14] = -100
+
+    out_default = m_default(ids, cu_seqlens=cu_seqlens, labels=labels)
+    out_fused = m_fused(ids, cu_seqlens=cu_seqlens, labels=labels)
+
+    assert out_default.lm_loss is not None and out_fused.lm_loss is not None
+    assert out_default.mtp_loss is not None and out_fused.mtp_loss is not None
+
+    torch.testing.assert_close(out_fused.lm_loss, out_default.lm_loss, rtol=1e-3, atol=0)
+    torch.testing.assert_close(out_fused.mtp_loss, out_default.mtp_loss, rtol=1e-3, atol=0)
+    torch.testing.assert_close(out_fused.loss, out_default.loss, rtol=1e-3, atol=0)
+    assert torch.equal(out_fused.n_tokens, out_default.n_tokens)
+
+
+@pytest.mark.cuda
+@pytest.mark.fla
+def test_fused_ce_lowers_peak_memory():
+    import gc
+
+    from sore.train.trainer import compile_model
+
+    def measure_peak(fused_ce: bool) -> int:
+        gc.collect()
+        torch.cuda.empty_cache()
+        cfg = get_preset("s150m", gdn_backend="fla", attn_backend="flex", fused_ce=fused_ce)
+        torch.manual_seed(0)
+        m = SoreLM(cfg).cuda()
+        compile_model(m)
+        ids = torch.randint(0, cfg.vocab_size, (1, 2048), device="cuda")
+        cu = torch.tensor([0, 2048], device="cuda", dtype=torch.long)
+
+        # Passo de aquecimento para compilar os blocos com Inductor
+        out = m(ids, cu_seqlens=cu, labels=ids)
+        out.loss.backward()
+
+        # Medição no passo de estado estacionário (sem o pico transitório de compilação JIT)
+        m.zero_grad(set_to_none=True)
+        del out
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        out = m(ids, cu_seqlens=cu, labels=ids)
+        out.loss.backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+
+        del m, ids, cu, out
+        torch._dynamo.reset()
+        gc.collect()
+        torch.cuda.empty_cache()
+        return peak
+
+    peak_chunked = measure_peak(fused_ce=False)
+    peak_fused = measure_peak(fused_ce=True)
+
+    assert peak_fused < peak_chunked, (
+        f"pico com fused_ce ({peak_fused / 1e6:.1f} MB) deve ser menor que chunked ({peak_chunked / 1e6:.1f} MB)"
+    )
+

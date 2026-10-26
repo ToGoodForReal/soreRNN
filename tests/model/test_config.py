@@ -79,9 +79,9 @@ def test_get_preset_unknown_name_lists_available():
         get_preset("nope")
 
 
-@pytest.mark.parametrize("flag", ["gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate"])
+@pytest.mark.parametrize("flag", ["gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate", "fused_ce"])
 def test_fla_only_options_reject_torch_backend(flag):
-    # as três opções usam kernels do FLA: com o backend torch seriam ignoradas em silêncio
+    # as quatro opções usam kernels do FLA: com o backend torch seriam ignoradas em silêncio
     with pytest.raises(ValueError, match=flag):
         ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, gdn_backend="torch", **{flag: True})
     cfg = ModelConfig(vocab_size=512, d_model=128, n_layers=4, ffn_dim=384, gdn_backend="fla", **{flag: True})
@@ -92,4 +92,4 @@ def test_fla_only_options_reject_torch_backend(flag):
 @pytest.mark.parametrize("name", ["s150m", "b0_8"])
 def test_fla_presets_enable_gdn_path_options(name):
     c = get_preset(name)
-    assert c.gdn_kernel_gate and c.gdn_fla_conv and c.fused_norm_gate
+    assert c.gdn_kernel_gate and c.gdn_fla_conv and c.fused_norm_gate and c.fused_ce

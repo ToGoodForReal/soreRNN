@@ -17,7 +17,7 @@ from sore.model.block import Block
 from sore.model.config import ModelConfig
 from sore.model.gdn import GatedDeltaNet
 from sore.model.layers import RMSNorm, SwiGLU
-from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss
+from sore.model.loss import ChunkCrossEntropy, chunked_lm_loss, fused_lm_loss
 from sore.model.mtp import MTPModule, mtp_labels, next_token_embeddings
 from sore.model.residual import GatedHyperResidual, PlainResidual, StreamFinal, init_stream
 
@@ -174,15 +174,21 @@ class SoreLM(nn.Module):
             return LMOutput(loss=None, lm_loss=None, mtp_loss=None, n_tokens=0)
 
         weight = self.head_weight
-        chunk = self.cfg.loss_chunk_size
-        lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), chunk, ce=self.chunk_ce)
+        if self.cfg.fused_ce:
+            lm_sum, n_tokens = fused_lm_loss(h.flatten(0, 1), weight, labels.flatten())
+        else:
+            chunk = self.cfg.loss_chunk_size
+            lm_sum, n_tokens = chunked_lm_loss(h.flatten(0, 1), weight, labels.flatten(), chunk, ce=self.chunk_ce)
         lm_loss = _mean_from_sum(lm_sum, n_tokens)
         loss, mtp_loss = lm_loss, None
         if self.mtp is not None and input_ids is not None:
             emb = x if inputs_embeds is None else self.embed(input_ids)
             h_mtp = self.mtp(h, next_token_embeddings(emb, cu_seqlens), cu_seqlens, block_mask, cu_seqlens_cpu)
             targets = mtp_labels(labels, cu_seqlens)
-            mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), chunk, ce=self.chunk_ce)
+            if self.cfg.fused_ce:
+                mtp_sum, n_mtp = fused_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten())
+            else:
+                mtp_sum, n_mtp = chunked_lm_loss(h_mtp.flatten(0, 1), weight, targets.flatten(), chunk, ce=self.chunk_ce)
             mtp_loss = _mean_from_sum(mtp_sum, n_mtp)
             loss = lm_loss + self.cfg.mtp_weight * mtp_loss
         return LMOutput(loss=loss, lm_loss=lm_loss, mtp_loss=mtp_loss, n_tokens=n_tokens)
