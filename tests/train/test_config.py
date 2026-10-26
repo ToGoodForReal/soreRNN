@@ -1,6 +1,45 @@
 import pytest
 
-from sore.train.config import parse_overrides
+from sore.train.config import Stage, TrainConfig, parse_overrides
+
+
+def test_stage_grad_accum_validation():
+    # stages válidos com grad_accum por estágio e tokens_per_step == 1024
+    stages = [
+        Stage(until_tokens=10_000, seq_len=128, micro_batch=4, grad_accum=2),
+        Stage(until_tokens=20_000, seq_len=256, micro_batch=1, grad_accum=4),
+    ]
+    cfg = TrainConfig(
+        model_preset="tiny",
+        data_paths=["data/*.bin"],
+        eos_id=0,
+        grad_accum=2,
+        stages=stages,
+        total_tokens=20_000,
+        ckpt_every_tokens=5_000,
+        out_dir="runs/test",
+    )
+    assert cfg.tokens_per_step == 1024
+    assert cfg.stage_grad_accum(stages[0]) == 2
+    assert cfg.stage_grad_accum(stages[1]) == 4
+
+    # trocar o segundo para grad_accum: 3 levanta ValueError
+    invalid_stages = [
+        Stage(until_tokens=10_000, seq_len=128, micro_batch=4, grad_accum=2),
+        Stage(until_tokens=20_000, seq_len=256, micro_batch=1, grad_accum=3),
+    ]
+    with pytest.raises(ValueError, match="grad_accum"):
+        TrainConfig(
+            model_preset="tiny",
+            data_paths=["data/*.bin"],
+            eos_id=0,
+            grad_accum=2,
+            stages=invalid_stages,
+            total_tokens=20_000,
+            ckpt_every_tokens=5_000,
+            out_dir="runs/test",
+        )
+
 
 
 def test_parse_overrides():

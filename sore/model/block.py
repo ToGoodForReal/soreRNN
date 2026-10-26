@@ -1,7 +1,10 @@
 """Block: uma camada do tronco, com dois sub-blocos pré-norma (mixer e SwiGLU), cada um com seu residual."""
+import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from sore.model.attention import GatedAttention
+from sore.model.checkpointing import selective_checkpoint_context_fn
 from sore.model.config import ModelConfig
 from sore.model.gdn import GatedDeltaNet
 from sore.model.layers import RMSNorm, SwiGLU
@@ -36,7 +39,10 @@ class Block(nn.Module):
         self.ffn = SwiGLU(cfg.d_model, cfg.ffn_dim)
         self.res_ffn = make_residual(cfg, layer_idx, sub=1)
 
-    def forward(
+    def _ffn_forward(self, u: Tensor) -> Tensor:
+        return self.ffn(self.norm2(u))
+
+    def _forward_plain(
         self, H: Tensor, cu_seqlens: Tensor | None = None, block_mask=None, cu_seqlens_cpu: Tensor | None = None
     ) -> Tensor:
         x = self.norm1(self.res_mixer.read(H))
@@ -47,6 +53,42 @@ class Block(nn.Module):
         H = self.res_mixer.write(H, y)
         H = self.res_ffn.write(H, self.ffn(self.norm2(self.res_ffn.read(H))))
         return H
+
+    def forward(
+        self,
+        H: Tensor,
+        cu_seqlens: Tensor | None = None,
+        block_mask=None,
+        cu_seqlens_cpu: Tensor | None = None,
+        checkpoint_policy: str | None = None,
+    ) -> Tensor:
+        if checkpoint_policy is None or not torch.is_grad_enabled():
+            return self._forward_plain(H, cu_seqlens, block_mask, cu_seqlens_cpu)
+
+        if checkpoint_policy == "ffn":
+            x = self.norm1(self.res_mixer.read(H))
+            if self.mixer_type == "attn":
+                y = self.mixer(x, cu_seqlens, block_mask)
+            else:
+                y = self.mixer(x, cu_seqlens, cu_seqlens_cpu)
+            H = self.res_mixer.write(H, y)
+            u = self.res_ffn.read(H)
+            y_ffn = checkpoint(self._ffn_forward, u, use_reentrant=False)
+            H = self.res_ffn.write(H, y_ffn)
+            return H
+
+        if checkpoint_policy == "selective":
+            return checkpoint(
+                self._forward_plain,
+                H,
+                cu_seqlens,
+                block_mask,
+                cu_seqlens_cpu,
+                use_reentrant=False,
+                context_fn=selective_checkpoint_context_fn,
+            )
+
+        raise ValueError(f"checkpoint_policy desconhecido: {checkpoint_policy!r}")
 
     def extra_repr(self) -> str:
         return f"layer_idx={self.layer_idx}, mixer_type={self.mixer_type!r}"

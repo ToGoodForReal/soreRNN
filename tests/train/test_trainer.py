@@ -16,8 +16,10 @@ import sore.train.trainer as trainer_module
 from sore.model import get_preset
 from sore.model.flops import flops_per_token
 from sore.train.__main__ import main as cli_main
+from sore.train.checkpoint import load_checkpoint
 from sore.train.config import Stage, TrainConfig, load_train_config, resolve_data_paths
 from sore.train.data import write_token_shard
+from sore.train.optim import build_optimizers
 from sore.train.schedule import wsd_multiplier
 from sore.train.trainer import LossSpikeDetector, TrainSummary, compile_model, train
 
@@ -756,3 +758,100 @@ def test_quality_config_values():
     assert cfg.total_steps == 305 and cfg.stages == [Stage(20_000_000, 2048, 2)]
     assert (cfg.warmup_steps, cfg.decay_frac, cfg.ckpt_every_tokens, cfg.compile) == (30, 0.2, 5_000_000, True)
     assert cfg.data_paths == ["data/sample_pt/*.bin"] and cfg.eos_id == 0 and cfg.out_dir == "runs/quality/ref_s0"
+
+
+def test_stage_grad_accum_steps_and_resume(tmp_path):
+    # stages com grad_accum por estágio e tokens_per_step == 1024
+    # stage 1: 128 * 4 * 2 = 1024; stage 2: 256 * 1 * 4 = 1024
+    shard = _shard(tmp_path / "s.bin", 6000)
+    stages = [
+        Stage(until_tokens=2048, seq_len=128, micro_batch=4, grad_accum=2),
+        Stage(until_tokens=4096, seq_len=256, micro_batch=1, grad_accum=4),
+    ]
+    # Execução ininterrupta
+    cfg_full = _cfg(tmp_path / "run_full", shard, stages, steps=4, grad_accum=2)
+    summary_full = train(cfg_full)
+    assert summary_full.steps == 4
+    metrics_full = _metrics(cfg_full.out_dir)
+    losses_full = [m["loss"] for m in metrics_full]
+
+    # Execução interrompida no meio do estágio 2 (passo 3 de 4)
+    cfg_split = _cfg(tmp_path / "run_split", shard, stages, steps=4, grad_accum=2)
+    first = train(cfg_split, max_steps=3)
+    assert first.steps == 3
+
+    # Retomada a partir do passo 3 até o fim (passo 4)
+    resumed = train(cfg_split, resume=Path(cfg_split.out_dir) / "last.pt")
+    assert resumed.steps == 4
+    metrics_split = _metrics(cfg_split.out_dir)
+    losses_split = [m["loss"] for m in metrics_split]
+
+    # Review Focus 4: a retomada no meio do estágio 2 dá os mesmos losses
+    np.testing.assert_allclose(losses_split, losses_full, rtol=1e-5, atol=1e-5)
+
+
+def test_resume_toggles_execution_fields(tmp_path):
+    # Review Focus 1: salva com checkpoint_policy="full" e fused_ce=False
+    # e retoma com "selective" e fused_ce=True (e o inverso), sem erro.
+    shard = _shard(tmp_path / "s.bin", 2000)
+    stages = [Stage(until_tokens=1000, seq_len=32, micro_batch=4)]
+
+    # 1. Salva com full e frac=1.0
+    cfg1 = _cfg(
+        tmp_path / "run1",
+        shard,
+        stages,
+        steps=5,
+        warmup_steps=0,
+        grad_accum=1,
+        compile_mode=None,
+        model_overrides=dict(CPU_BACKENDS, checkpoint_policy="full", checkpoint_frac=1.0),
+    )
+    train(cfg1, max_steps=1)
+    ckpt_path = Path(cfg1.out_dir) / "last.pt"
+
+    # Retoma com selective e frac=0.5
+    cfg2 = _cfg(
+        tmp_path / "run2",
+        shard,
+        stages,
+        steps=5,
+        warmup_steps=0,
+        grad_accum=1,
+        compile_mode="reduce-overhead",
+        model_overrides=dict(CPU_BACKENDS, checkpoint_policy="selective", checkpoint_frac=0.5),
+    )
+    # Deve carregar o checkpoint sem erro de arquitetura diferente
+    model = lm_module.SoreLM(get_preset("tiny", **cfg2.model_overrides))
+    opts = build_optimizers(model, lr_muon=cfg2.lr_muon, lr_adamw=cfg2.lr_adamw, weight_decay=cfg2.weight_decay)
+    load_checkpoint(ckpt_path, model, opts)
+
+    # 2. Inverso: salva com selective e frac=0.5
+    cfg3 = _cfg(
+        tmp_path / "run3",
+        shard,
+        stages,
+        steps=5,
+        warmup_steps=0,
+        grad_accum=1,
+        compile_mode="reduce-overhead",
+        model_overrides=dict(CPU_BACKENDS, checkpoint_policy="selective", checkpoint_frac=0.5),
+    )
+    train(cfg3, max_steps=1)
+    ckpt_path3 = Path(cfg3.out_dir) / "last.pt"
+
+    # Retoma com full e frac=1.0
+    cfg4 = _cfg(
+        tmp_path / "run4",
+        shard,
+        stages,
+        steps=5,
+        warmup_steps=0,
+        grad_accum=1,
+        compile_mode=None,
+        model_overrides=dict(CPU_BACKENDS, checkpoint_policy="full", checkpoint_frac=1.0),
+    )
+    model4 = lm_module.SoreLM(get_preset("tiny", **cfg4.model_overrides))
+    opts4 = build_optimizers(model4, lr_muon=cfg4.lr_muon, lr_adamw=cfg4.lr_adamw, weight_decay=cfg4.weight_decay)
+    load_checkpoint(ckpt_path3, model4, opts4)
+

@@ -16,7 +16,12 @@ from sore.model.layers import RMSNorm
 from sore.model.rope import PartialRotary
 from sore.model.varlen import doc_ids_from_cu_seqlens, positions_from_cu_seqlens
 
-_compiled_flex = None  # torch.compile(flex_attention), criado na primeira chamada em CUDA
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+    _compiled_flex = torch.compile(flex_attention)
+except Exception:
+    flex_attention = None
+    _compiled_flex = None
 
 # Abaixo de um bloco do BlockMask (128) o flex compilado falha no Inductor ("Invalid
 # FlexAttention decode kernel options" com T=127, torch 2.14.1); aí o sdpa denso é barato.
@@ -47,12 +52,12 @@ def doc_causal_block_mask(cu_seqlens: Tensor | None, t: int, device: torch.devic
 
 def _get_flex_attention(on_cuda: bool):
     """`flex_attention` compilado em CUDA (sem compilar ele materializa a matriz de scores inteira)."""
-    from torch.nn.attention.flex_attention import flex_attention
-
     if not on_cuda:
+        from torch.nn.attention.flex_attention import flex_attention
         return flex_attention
     global _compiled_flex
     if _compiled_flex is None:
+        from torch.nn.attention.flex_attention import flex_attention
         _compiled_flex = torch.compile(flex_attention)
     return _compiled_flex
 

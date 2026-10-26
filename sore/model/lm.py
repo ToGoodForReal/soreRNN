@@ -14,6 +14,7 @@ from torch.utils.checkpoint import checkpoint
 
 from sore.model.attention import FLEX_MIN_LEN, GatedAttention, doc_causal_block_mask
 from sore.model.block import Block
+from sore.model.checkpointing import checkpointed_blocks
 from sore.model.config import ModelConfig
 from sore.model.gdn import GatedDeltaNet
 from sore.model.layers import RMSNorm, SwiGLU
@@ -150,9 +151,18 @@ class SoreLM(nn.Module):
             if cu is not None:
                 torch._dynamo.maybe_mark_dynamic(cu, 0)
         use_checkpoint = self.cfg.grad_checkpoint and torch.is_grad_enabled()
-        for block in self.blocks:
-            if use_checkpoint:
-                H = checkpoint(block, H, cu_seqlens, block_mask, cu_seqlens_cpu, use_reentrant=False)
+        ckpt_blocks = (
+            checkpointed_blocks(len(self.blocks), self.cfg.checkpoint_frac)
+            if use_checkpoint
+            else frozenset()
+        )
+        policy = self.cfg.checkpoint_policy
+        for i, block in enumerate(self.blocks):
+            if i in ckpt_blocks:
+                if policy == "full":
+                    H = checkpoint(block, H, cu_seqlens, block_mask, cu_seqlens_cpu, use_reentrant=False)
+                else:
+                    H = block(H, cu_seqlens, block_mask, cu_seqlens_cpu, checkpoint_policy=policy)
             else:
                 H = block(H, cu_seqlens, block_mask, cu_seqlens_cpu)
         return self.norm(self.stream_final(H))

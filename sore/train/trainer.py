@@ -92,7 +92,7 @@ def _sync_stage(stream: PackedTokenStream, stages: list[Stage]) -> bool:
     return True
 
 
-def compile_model(model: SoreLM) -> SoreLM:
+def compile_model(model: SoreLM, mode: str | None = None) -> SoreLM:
     """Compila cada Block e a CE da loss in-place (`nn.Module.compile`) e devolve o próprio `model`.
 
     Usado pelo trainer e pelo `scripts/bench.py`. Ruling R25: compilar o modelo inteiro não adianta
@@ -118,7 +118,7 @@ def compile_model(model: SoreLM) -> SoreLM:
     if not model.cfg.fused_ce:
         modules.append(model.chunk_ce)
     for module in modules:
-        module.compile(dynamic=False)
+        module.compile(mode=mode, dynamic=False)
     return model
 
 
@@ -140,7 +140,16 @@ def _to_device(batch, device: torch.device) -> tuple[torch.Tensor, torch.Tensor,
     return tuple(t.to(device, non_blocking=True) for t in tensors)
 
 
-def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: float, mtp_weight: float) -> dict:
+def _train_step(
+    model,
+    optimizers,
+    stream,
+    cfg: TrainConfig,
+    device,
+    lr_mult: float,
+    mtp_weight: float,
+    grad_accum: int | None = None,
+) -> dict:
     """Um passo de otimização; devolve as métricas do passo (médias ponderadas por token).
 
     O loss de cada micro-batch é `lm_loss + mtp_weight * mtp_loss`. O `out.loss` do modelo (que usa
@@ -151,7 +160,8 @@ def _train_step(model, optimizers, stream, cfg: TrainConfig, device, lr_mult: fl
     dentro do loop de micro-batches espera a CPU: a contagem de tokens válidos de cada um já está na
     CPU (`n_valid`) e o `out.n_tokens` do modelo, um tensor, não é lido aqui.
     """
-    batches = [next(stream) for _ in range(cfg.grad_accum)]
+    accum = grad_accum if grad_accum is not None else cfg.grad_accum
+    batches = [next(stream) for _ in range(accum)]
     n_valid = [int((b.labels != IGNORE_INDEX).sum()) for b in batches]
     n_step = sum(n_valid)
     inputs = [_to_device(b, device) for b in batches]
@@ -257,7 +267,7 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     model = SoreLM(get_preset(cfg.model_preset, **cfg.model_overrides)).to(device)
     optimizers = build_optimizers(model, cfg.lr_muon, cfg.lr_adamw, cfg.weight_decay)
     if cfg.compile:
-        compile_model(model)  # in-place, por Block: os nomes dos parâmetros não mudam
+        compile_model(model, mode=cfg.compile_mode)  # in-place, por Block: os nomes dos parâmetros não mudam
     first = cfg.stages[0]
     stream = PackedTokenStream(
         resolve_data_paths(cfg.data_paths), first.seq_len, first.micro_batch, cfg.eos_id, cfg.seed,
@@ -311,7 +321,10 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
             t0, tokens_before = time.perf_counter(), stream.tokens_consumed
             lr_mult = wsd_multiplier(step, cfg.warmup_steps, total_steps, cfg.decay_frac)
             mtp_weight = linear_schedule(step, total_steps, mtp_start, cfg.mtp_weight_end)
-            stats = _train_step(model, optimizers, stream, cfg, device, lr_mult, mtp_weight)
+            stage = active_stage(cfg.stages, stream.tokens_consumed)
+            stats = _train_step(
+                model, optimizers, stream, cfg, device, lr_mult, mtp_weight, grad_accum=cfg.stage_grad_accum(stage)
+            )
             ema = spikes.ema  # antes deste passo, para o aviso
             spike = step >= cfg.warmup_steps and spikes(stats["loss"])  # `step` ainda é o índice 0-based
             step, attempts = step + 1, attempts + 1

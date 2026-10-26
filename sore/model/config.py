@@ -54,6 +54,8 @@ class ModelConfig:
     gdn_fla_conv: bool = False  # conv causal + SiLU do FLA no lugar de `causal_conv1d_varlen` + F.silu
     fused_norm_gate: bool = False  # RMSNorm · silu(gate) da saída do GDN num kernel só
     fused_ce: bool = False  # cross-entropy fundida do FLA (linear head + cross-entropy num kernel só)
+    checkpoint_policy: Literal["full", "ffn", "selective"] = "full"
+    checkpoint_frac: float = 1.0
 
     def __post_init__(self) -> None:
         # YAML/JSON devolvem lista; normaliza para tupla (hashable e comparável)
@@ -74,6 +76,10 @@ class ModelConfig:
             )
         if self.loss_chunk_size <= 0:
             raise ValueError(f"loss_chunk_size deve ser positivo; recebi {self.loss_chunk_size}")
+        if self.checkpoint_policy not in ("full", "ffn", "selective"):
+            raise ValueError(f"checkpoint_policy desconhecido: {self.checkpoint_policy!r}")
+        if not (0.0 < self.checkpoint_frac <= 1.0):
+            raise ValueError(f"checkpoint_frac deve estar em (0, 1]; recebi {self.checkpoint_frac}")
         if self.gdn_backend != "fla":
             for flag in ("gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate", "fused_ce"):
                 if getattr(self, flag):

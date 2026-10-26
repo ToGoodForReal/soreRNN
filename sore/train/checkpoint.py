@@ -19,6 +19,7 @@ from sore.model import SoreLM
 _EXECUTION_FIELDS = (
     "gdn_backend", "attn_backend", "grad_checkpoint", "mtp_weight", "loss_chunk_size",
     "gdn_kernel_gate", "gdn_fla_conv", "fused_norm_gate", "fused_ce",
+    "checkpoint_policy", "checkpoint_frac",
 )
 
 

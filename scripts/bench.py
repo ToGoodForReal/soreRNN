@@ -132,6 +132,7 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=2, help="passos iniciais fora da mediana")
     parser.add_argument("--compile", action="store_true", help="torch.compile por Block (compile_model, como o trainer)")
+    parser.add_argument("--compile-mode", default=None, help="modo de torch.compile (ex: max-autotune-no-cudagraphs)")
     parser.add_argument("--grad-checkpoint", action="store_true", help="activation checkpointing por bloco")
     parser.add_argument("--peak-tflops", type=float, default=165.0, help="pico BF16 denso da GPU (4090: 165)")
     parser.add_argument("--json", action="store_true", help="imprime também o resultado em JSON")
@@ -171,7 +172,7 @@ def main() -> None:
     model = SoreLM(cfg).to(device)
     optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
     if args.compile:
-        compile_model(model)  # in-place, por Block
+        compile_model(model, mode=args.compile_mode)  # in-place, por Block
     flops = flops_per_token(cfg, args.seq_len)
     tokens = args.seq_len * args.micro_batch * args.grad_accum  # por passo
     print(
@@ -221,6 +222,7 @@ def main() -> None:
         "micro_batch": args.micro_batch,
         "grad_accum": args.grad_accum,
         "compile": args.compile,
+        "compile_mode": args.compile_mode,
         "grad_checkpoint": args.grad_checkpoint,
         "steps": args.steps,
         "warmup": args.warmup,

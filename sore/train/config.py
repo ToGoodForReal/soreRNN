@@ -44,12 +44,18 @@ class Stage:
     until_tokens: int
     seq_len: int
     micro_batch: int
+    grad_accum: int | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):
-            setattr(self, f.name, _as_int(f"stages.{f.name}", getattr(self, f.name)))
+            val = getattr(self, f.name)
+            if f.name == "grad_accum" and val is None:
+                continue
+            setattr(self, f.name, _as_int(f"stages.{f.name}", val))
         if self.seq_len < 1 or self.micro_batch < 1:
             raise ValueError(f"estágio com seq_len/micro_batch < 1: {self}")
+        if self.grad_accum is not None and self.grad_accum < 1:
+            raise ValueError(f"estágio com grad_accum < 1: {self}")
 
 
 _INT_FIELDS = (
@@ -91,6 +97,7 @@ class TrainConfig:
 
     # Execução (`out_dir` é o diretório do run: metrics.jsonl, last.pt e os snapshots ficam nele)
     compile: bool = False
+    compile_mode: str | None = None
     log_every: int = 10
     ckpt_every_tokens: int
     snapshot_every_tokens: int = 0  # snapshot_step{passo}.pt numerado a cada N tokens; 0 = desligado
@@ -127,10 +134,12 @@ class TrainConfig:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} deve ser >= 0, recebeu {value}")
-        per_micro = {s.seq_len * s.micro_batch for s in self.stages}
-        if len(per_micro) != 1:
+        per_step = {s.seq_len * s.micro_batch * self.stage_grad_accum(s) for s in self.stages}
+        if len(per_step) != 1:
             # tokens por passo constantes => o schedule por passo (WSD) é exato entre estágios
-            raise ValueError(f"seq_len * micro_batch deve ser igual em todos os estágios, recebeu {sorted(per_micro)}")
+            raise ValueError(
+                f"seq_len * micro_batch * grad_accum deve ser igual em todos os estágios, recebeu {sorted(per_step)}"
+            )
         longest = max(s.seq_len for s in self.stages)
         if any(longest % s.seq_len for s in self.stages):
             # o stream corta o corpus em unidades do maior seq_len (R22)
@@ -143,10 +152,14 @@ class TrainConfig:
         if until[-1] < self.total_tokens:
             raise ValueError(f"o último estágio (until_tokens={until[-1]}) não cobre total_tokens={self.total_tokens}")
 
+    def stage_grad_accum(self, stage: Stage) -> int:
+        """`grad_accum` do estágio (ou o `grad_accum` global se o estágio não especificar)."""
+        return stage.grad_accum if stage.grad_accum is not None else self.grad_accum
+
     @property
     def tokens_per_step(self) -> int:
         s = self.stages[0]
-        return s.seq_len * s.micro_batch * self.grad_accum
+        return s.seq_len * s.micro_batch * self.stage_grad_accum(s)
 
     @property
     def total_steps(self) -> int:
