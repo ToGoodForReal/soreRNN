@@ -102,12 +102,37 @@ def test_select_pruned_vocab_residual_filling():
     # Merges: ("<0x00>", "<0x01>") -> "x", ("x", "<0x00>") -> "xx"
     merges = [("<0x00>", "<0x01>"), ("x", "<0x00>")]
     full_vocab = ["<0x00>", "<0x01>", "x", "xx", "y"]
-    # Sem frequências para "x", apenas "y" tem frequência mas target_size permite todos
+    # Sem frequências para "x", apenas "y" tem frequência (>0).
+    # O loop guloso consome "y", ocupando 3 slots (protected + "y").
+    # O 4º slot obrigatoriamente vem do preenchimento residual,
+    # que deve escolher "x" (custo transitivo 1) em vez de "xx" (custo transitivo 2).
     freqs = {"y": 10}
     selected_vocab, pruned_merges = select_pruned_vocab(
         freqs, full_vocab, merges, protected, target_size=4
     )
     assert len(selected_vocab) == 4
     assert protected.issubset(selected_vocab)
+    assert "y" in selected_vocab
+    assert "x" in selected_vocab
+    assert "xx" not in selected_vocab
     assert is_merge_closed(selected_vocab, pruned_merges)
+
+
+def test_select_pruned_vocab_zero_frequencies_use_residual_filling():
+    protected = {"<0x00>"}
+    # Merges: ("<0x00>", "<0x00>") -> "a", ("a", "<0x00>") -> "b"
+    merges = [("<0x00>", "<0x00>"), ("a", "<0x00>")]
+    full_vocab = ["<0x00>", "a", "b"]
+    # Frequências com 0 para "b" e sem frequência para "a"
+    # "b" tem custo 2 (precisa de "a"). O loop guloso ignora freq <= 0.
+    # O preenchimento residual escolhe "a" (menor custo transitivo = 1).
+    freqs = {"b": 0}
+    selected_vocab, pruned_merges = select_pruned_vocab(
+        freqs, full_vocab, merges, protected, target_size=2
+    )
+    assert len(selected_vocab) == 2
+    assert "a" in selected_vocab
+    assert "b" not in selected_vocab
+    assert is_merge_closed(selected_vocab, pruned_merges)
+
 

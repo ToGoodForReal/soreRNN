@@ -9,7 +9,11 @@ def _piece_to_str(piece: str) -> str:
     """Converte representação hexadecimal de byte (<0xHH>) para caractere, ou retorna a peça original."""
     m = _HEX_BYTE_RE.match(piece)
     if m:
-        return chr(int(m.group(1), 16))
+        byte_val = int(m.group(1), 16)
+        try:
+            return bytes([byte_val]).decode("utf-8")
+        except UnicodeDecodeError:
+            return bytes([byte_val]).decode("latin-1")
     return piece
 
 
@@ -17,7 +21,13 @@ def _merge_result(left: str, right: str) -> str:
     """Determina o token resultante da concatenação de duas peças BPE, considerando fallback de bytes."""
     m_left = _HEX_BYTE_RE.match(left)
     m_right = _HEX_BYTE_RE.match(right)
-    if m_left or m_right:
+    if m_left and m_right:
+        raw_bytes = bytes([int(m_left.group(1), 16), int(m_right.group(1), 16)])
+        try:
+            return raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return _piece_to_str(left) + _piece_to_str(right)
+    elif m_left or m_right:
         s_left = _piece_to_str(left)
         s_right = _piece_to_str(right)
         return s_left + s_right
@@ -173,9 +183,12 @@ def select_pruned_vocab(
         )
 
     if len(selected_vocab) < target_size:
-        # Fila de prioridade de candidatos: ordenação estável por frequência decrescente
-        candidates = [t for t in full_vocab if t not in selected_vocab]
-        candidates.sort(key=lambda t: frequencies.get(t, 0), reverse=True)
+        # Fila de prioridade de candidatos observados: apenas tokens com frequência estritamente positiva (> 0)
+        candidates = [
+            t for t in full_vocab
+            if t not in selected_vocab and frequencies.get(t, 0) > 0
+        ]
+        candidates.sort(key=lambda t: frequencies[t], reverse=True)
 
         for token in candidates:
             if len(selected_vocab) == target_size:
