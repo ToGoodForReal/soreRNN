@@ -25,115 +25,133 @@ class SimpleMockTokenizer:
         return [abs(hash(w)) % (self.vocab_size - 1) for w in words]
 
 
-def _build_mock_generator(docs: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-    """Gera stream contínuo ciclando sobre a lista de documentos fornecida."""
+def _make_procedural_pt_web_doc(i: int) -> dict[str, Any]:
+    topics = [
+        "redes neurais profundas e mecanismos de atenção convolucional",
+        "computação quântica e arquiteturas de supercomputadores modernos",
+        "biologia molecular e sequenciamento genético automatizado",
+        "energia solar fotovoltaica e transição energética sustentável",
+        "agricultura de precisão e sensoriamento remoto por satélites",
+        "arqueologia subaquática e preservação do patrimônio histórico",
+        "astronomia observacional e telescópios espaciais infravermelhos",
+        "economia circular e reciclagem de materiais compósitos industriais",
+    ]
+    actions = [
+        "desenvolvem novas abordagens metodológicas para otimizar",
+        "analisam os impactos socioeconômicos decorrentes de",
+        "apresentam resultados empíricos consistentes demonstrando",
+        "investigam correlações estatísticas significativas entre",
+        "propõem modelos preditivos avançados capazes de antecipar",
+        "estabelecem diretrizes normativas essenciais para regular",
+        "conduzem experimentos laboratoriais controlados avaliando",
+        "sintetizam evidências documentais recentes a respeito de",
+    ]
+    t1 = topics[i % len(topics)]
+    t2 = topics[(i + 3) % len(topics)]
+    a1 = actions[(i // len(topics)) % len(actions)]
+    a2 = actions[(i + 5) % len(actions)]
+
+    text = (
+        f"No âmbito dos estudos sobre {t1}, pesquisadores brasileiros {a1} o progresso técnico "
+        f"no setor científico número {i}. As análises qualitativas confirmam que {t2} desempenham papel "
+        f"relevante na infraestrutura nacional. Ademais, especialistas renomados {a2} as novas descobertas "
+        f"com rigor metodológico exemplar. Este documento de registro número {i} sintetiza contribuições "
+        f"relevantes para a ciência e tecnologia do país com qualidade e inovação contínua."
+    )
+    return {"text": text, "is_pt": True}
+
+
+def _make_procedural_pt_hq_doc(i: int) -> dict[str, Any]:
+    disciplines = [
+        "A linguística histórica", "A termodinâmica estatística", "A geometria diferencial",
+        "A sociologia urbana", "A oceanografia física", "A microeletrônica aplicada",
+        "A farmacologia molecular", "A climatologia regional"
+    ]
+    concepts = [
+        "a evolução estrutural dos dialetos ibéricos contemporâneos",
+        "o transporte de calor em fluidos não-lineares turbulentos",
+        "a curvatura de variedades riemannianas de dimensão arbitrária",
+        "a segregação espacial e os padrões de mobilidade coletiva",
+        "a circulação termohalina e a dinâmica de massas d'água profundas",
+        "a litografia ultravioleta extrema para transistores nanométricos",
+        "a interação ligante-receptor em biomembranas lipídicas complexas",
+        "as anomalias pluviométricas e teleconexões atmosféricas tropicais"
+    ]
+    d = disciplines[i % len(disciplines)]
+    c = concepts[i % len(concepts)]
+    text = (
+        f"{d} constitui um ramo do conhecimento voltado a compreender {c} no documento enciclopédico {i}. "
+        f"Investigações documentadas atestam que os princípios fundamentais formulados no século passado "
+        f"fornecem instrumentos teóricos consistentes para modelar fenômenos complexos na edição {i}. "
+        f"Dessa maneira, a sistematização rigorosa de hipóteses e a validação empírica de teses acadêmicas "
+        f"asseguram a consolidação do saber científico de alta qualidade em benefício de toda a sociedade."
+    )
+    return {"text": text, "is_pt": True}
+
+
+def _make_procedural_en_edu_doc(i: int) -> dict[str, Any]:
+    fields = [
+        "Numerical linear algebra", "Statistical physics", "Information theory",
+        "Abstract algebra", "Differential equations", "Quantum electrodynamics",
+        "Graph theory", "Optimization theory"
+    ]
+    topics = [
+        "eigenvalue computation via Lanczos iteration techniques",
+        "phase transitions in two-dimensional Ising lattice models",
+        "channel capacity bounds under additive white Gaussian noise",
+        "homomorphism theorems for finitely generated Abelian groups",
+        "existence and uniqueness criteria for boundary value problems",
+        "renormalization group flow in perturbative quantum gauge theories",
+        "spectral clustering bounds derived from graph Laplacian matrices",
+        "primal-dual interior point algorithms for semidefinite programs"
+    ]
+    f = fields[i % len(fields)]
+    t = topics[i % len(topics)]
+    text = (
+        f"{f} provides an essential mathematical framework for analyzing {t} in instructional unit {i}. "
+        f"Theoretical derivations demonstrate that rigorous error bounds and convergence rates can be established "
+        f"under standard regularity assumptions throughout lesson module {i}. Consequently, students and "
+        f"researchers gain deep understanding of underlying algorithmic principles and computational complexity "
+        f"necessary for developing scalable software solutions across diverse scientific domains."
+    )
+    return {"text": text, "is_pt": False}
+
+
+def _make_procedural_code_doc(i: int) -> dict[str, Any]:
+    funcs = ["transform_vector", "compute_hash_index", "validate_packet", "aggregate_metrics",
+             "serialize_state", "interpolate_spline", "decompose_tensor", "filter_frequencies"]
+    fn = funcs[i % len(funcs)]
+    text = (
+        f"def {fn}_v{i}(data_series: list[float], threshold_factor: float = 0.75, offset_val: int = {i}) -> list[float]:\n"
+        f"    \"\"\"Performs deterministic numerical transformation for data stream unit {i}.\"\"\"\n"
+        f"    processed_buffer: list[float] = []\n"
+        f"    for index_counter, sample_value in enumerate(data_series):\n"
+        f"        normalized = (sample_value * threshold_factor) + (offset_val % 17)\n"
+        f"        if normalized > 0.0 and (index_counter + {i}) % 2 == 0:\n"
+        f"            processed_buffer.append(round(normalized, 6))\n"
+        f"        else:\n"
+        f"            processed_buffer.append(0.0)\n"
+        f"    return processed_buffer\n"
+    )
+    # Utiliza coluna "content" (padrão The Stack v2) para validar fallback de campos
+    return {"content": text, "is_pt": False}
+
+
+def _build_procedural_generator(fn: Any) -> Iterator[dict[str, Any]]:
+    """Gera stream contínuo procedural sem colisões de MinHash LSH."""
+    idx = 0
     while True:
-        for d in docs:
-            yield dict(d)
+        yield fn(idx)
+        idx += 1
 
 
 def get_mock_sources() -> dict[str, Iterator[dict[str, Any]]]:
-    """Cria fontes sintéticas variadas em PT, EN e Código que satisfazem os filtros de qualidade."""
-    pt_web_base = [
-        {
-            "text": (
-                "A inteligência artificial generativa e os modelos de linguagem em grande escala "
-                "transformaram profundamente o cenário científico e tecnológico contemporâneo em todo o país. "
-                "Pesquisadores brasileiros dedicam-se ao desenvolvimento de arquiteturas mais eficientes, compactas "
-                "e especializadas no português brasileiro, promovendo soberania tecnológica e inclusão digital ampla."
-            ),
-            "is_pt": True,
-        },
-        {
-            "text": (
-                "O treinamento de redes neurais profundas requer infraestrutura de alto desempenho e grandes "
-                "volumes de dados textuais cuidadosamente tratados e limpos. A correta higienização do corpus, "
-                "incluindo a eliminação de ruídos e repetições indesejadas, é fundamental para garantir a convergência "
-                "estável do modelo e a coerência das respostas geradas pelo assistente."
-            ),
-            "is_pt": True,
-        },
-    ]
-
-    pt_hq_base = [
-        {
-            "text": (
-                "A ciência da computação teórica estuda a complexidade de algoritmos e a capacidade intrínseca "
-                "dos autômatos formais e sistemas de transição de estados. Na linguística computacional, "
-                "representações probabilísticas e modelos de n-gramas formaram a base para o desenvolvimento "
-                "dos atuais transformadores e modelos neurais autorregressivos de alta fidelidade semântica."
-            ),
-            "is_pt": True,
-        },
-        {
-            "text": (
-                "O bioma da Amazônia abriga a maior biodiversidade tropical do planeta Terra, com milhares "
-                "de espécies endêmicas de flora e fauna catalogadas por instituições científicas nacionais. "
-                "A conservação ambiental e o manejo florestal sustentável são temas de relevância global para "
-                "a mitigação das mudanças climáticas e o equilíbrio hídrico continental da América do Sul."
-            ),
-            "is_pt": True,
-        },
-    ]
-
-    en_edu_base = [
-        {
-            "text": (
-                "Linear dynamical systems and state space models define a powerful mathematical foundation "
-                "for sequential data processing in continuous time. By discretizing state transition equations "
-                "with bilinear transforms, neural architectures can achieve constant recurrent state complexity "
-                "during token generation and linear training cost with respect to context window length."
-            ),
-            "is_pt": False,
-        },
-        {
-            "text": (
-                "Matrix decomposition methods such as singular value decomposition and eigenvalue factorization "
-                "provide essential analytical tools for dimensionality reduction in machine learning pipelines. "
-                "These transformations preserve dominant variance directions while eliminating redundant numerical "
-                "projections across high-dimensional feature spaces."
-            ),
-            "is_pt": False,
-        },
-    ]
-
-    code_base = [
-        {
-            "text": (
-                "def binary_search_insert_position(sorted_array: list[int], target: int) -> int:\n"
-                "    \"\"\"Finds the insertion index for target in a sorted list using binary search.\"\"\"\n"
-                "    low, high = 0, len(sorted_array)\n"
-                "    while low < high:\n"
-                "        mid = (low + high) // 2\n"
-                "        if sorted_array[mid] < target:\n"
-                "            low = mid + 1\n"
-                "        else:\n"
-                "            high = mid\n"
-                "    return low\n"
-            ),
-            "is_pt": False,
-        },
-        {
-            "text": (
-                "class AccumulatorBuffer:\n"
-                "    \"\"\"Thread-safe rolling accumulator for continuous streaming metrics.\"\"\"\n"
-                "    def __init__(self, max_size: int = 1000):\n"
-                "        self.max_size = max_size\n"
-                "        self.values: list[float] = []\n"
-                "    def push(self, val: float) -> None:\n"
-                "        if len(self.values) >= self.max_size:\n"
-                "            self.values.pop(0)\n"
-                "        self.values.append(val)\n"
-            ),
-            "is_pt": False,
-        },
-    ]
-
+    """Cria fontes sintéticas variadas em PT, EN e Código com geração procedural infinita."""
     return {
-        "pt_web": _build_mock_generator(pt_web_base),
-        "pt_hq": _build_mock_generator(pt_hq_base),
-        "en_edu": _build_mock_generator(en_edu_base),
-        "code": _build_mock_generator(code_base),
+        "pt_web": _build_procedural_generator(_make_procedural_pt_web_doc),
+        "pt_hq": _build_procedural_generator(_make_procedural_pt_hq_doc),
+        "en_edu": _build_procedural_generator(_make_procedural_en_edu_doc),
+        "code": _build_procedural_generator(_make_procedural_code_doc),
     }
 
 
@@ -268,9 +286,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Diretório de saída     : {args.output_dir}")
     print(f"Shards gerados         : {len(shards)}")
     print(f"Documentos lidos       : {stats['documents_seen']}")
-    print(f"Documentos filtrados   : {stats['documents_filtered']}")
-    print(f"Documentos duplicados  : {stats['documents_duplicated']}")
     print(f"Documentos aceitos     : {stats['documents_accepted']}")
+    print(f"Documentos duplicados  : {stats['documents_duplicated']}")
+    print(f"Documentos filtrados   : {stats['documents_filtered']}")
+    rejections = stats.get("filter_rejections", {})
+    print("  - Comprimento (length)        :", rejections.get("length", 0))
+    print("  - Densidade alfanumérica      :", rejections.get("alpha_density", 0))
+    print("  - Repetição de linhas         :", rejections.get("line_repetition", 0))
+    print("  - Repetição de n-gramas       :", rejections.get("ngram_repetition", 0))
+    print("  - Stopwords em português      :", rejections.get("pt_stopwords", 0))
     print(f"Tokens gravados        : {stats['tokens_written']}")
     print("==================================================")
     for s in shards:

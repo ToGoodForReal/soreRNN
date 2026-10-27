@@ -163,6 +163,90 @@ def test_run_pipeline_stats_and_limits(tmp_path: Path):
     assert stats["tokens_written"] > 0
 
 
+def test_run_pipeline_content_column_fallback(tmp_path: Path):
+    # The Stack v2 utiliza "content" em vez de "text"
+    code_content = (
+        "def compute_streaming_moving_average(data_series: list[float], window_size: int = 10) -> list[float]:\n"
+        "    \"\"\"Calculates running moving average across sequential time series windows.\"\"\"\n"
+        "    if not data_series or window_size <= 0:\n"
+        "        return []\n"
+        "    output_averages: list[float] = []\n"
+        "    running_cumulative_sum = 0.0\n"
+        "    for index, val in enumerate(data_series):\n"
+        "        running_cumulative_sum += val\n"
+        "        if index >= window_size:\n"
+        "            running_cumulative_sum -= data_series[index - window_size]\n"
+        "            output_averages.append(running_cumulative_sum / window_size)\n"
+        "        else:\n"
+        "            output_averages.append(running_cumulative_sum / (index + 1))\n"
+        "    return output_averages\n"
+    )
+    sources = {
+        "code": [{"content": code_content, "is_pt": False}]
+    }
+    tokenizer = MockTokenizer()
+
+    shards, stats = run_pipeline(
+        sources=sources,
+        weights={"code": 1.0},
+        tokenizer=tokenizer,
+        out_dir=tmp_path / "content_shards",
+        max_tokens=500,
+        shard_size=128,
+        unit_len=8,
+        return_stats=True,
+    )
+
+    assert stats["documents_accepted"] == 1
+    assert stats["tokens_written"] > 0
+    assert len(shards) >= 1
+
+
+def test_run_pipeline_detailed_filter_rejections(tmp_path: Path):
+    # Prepara documentos direcionados para falhar em cada filtro individualmente
+    bad_length = "Muito curto para satisfazer o filtro."
+    # 35 palavras para passar no check_length (>= 30 palavras e >= 150 chars), mas com baixa densidade alfanumérica (< 70%)
+    bad_alpha = " ".join([f"!@#{w}$%^" for w in ["palavra"] * 35])
+    bad_lines = "\n".join(["Esta mesma linha exata repete-se continuadamente por muitas vezes consecutivas neste texto de teste."] * 10)
+    bad_ngrams = "palavra teste loop constante " * 20
+    bad_stopwords = (
+        "The extraordinary development of artificial intelligence has reshaped global technology landscape. "
+        "Researchers investigate scalable algorithms and deep neural representations for language models. "
+        "Computational complexity and statistical foundations are crucial for large scale training."
+    )
+
+    sources = {
+        "test_filters": [
+            {"text": bad_length, "is_pt": True},
+            {"text": bad_alpha, "is_pt": True},
+            {"text": bad_lines, "is_pt": True},
+            {"text": bad_ngrams, "is_pt": True},
+            {"text": bad_stopwords, "is_pt": True},
+        ]
+    }
+    tokenizer = MockTokenizer()
+
+    shards, stats = run_pipeline(
+        sources=sources,
+        weights={"test_filters": 1.0},
+        tokenizer=tokenizer,
+        out_dir=tmp_path / "filter_rejection_shards",
+        max_tokens=1000,
+        shard_size=128,
+        unit_len=8,
+        return_stats=True,
+    )
+
+    rejections = stats["filter_rejections"]
+    assert rejections["length"] >= 1
+    assert rejections["alpha_density"] >= 1
+    assert rejections["line_repetition"] >= 1
+    assert rejections["ngram_repetition"] >= 1
+    assert rejections["pt_stopwords"] >= 1
+    assert sum(rejections.values()) == stats["documents_filtered"]
+    assert stats["documents_accepted"] == 0
+
+
 def test_prepare_data_cli(tmp_path: Path):
     import subprocess
     import sys
@@ -189,3 +273,36 @@ def test_prepare_data_cli(tmp_path: Path):
     assert len(bin_files) >= 1
     json_files = list(out_dir.glob("shard_*.json"))
     assert len(json_files) == len(bin_files)
+
+
+def test_prepare_data_cli_procedural_mock_large_volume(tmp_path: Path):
+    """Garante que a geração procedural mock não trava em loop infinito para max_tokens > 350."""
+    import subprocess
+    import sys
+
+    out_dir = tmp_path / "cli_large_mock_shards"
+    cmd = [
+        sys.executable,
+        "scripts/prepare_data.py",
+        "--mock",
+        "--output-dir",
+        str(out_dir),
+        "--max-tokens",
+        "2000",
+        "--shard-size",
+        "512",
+        "--unit-len",
+        "8",
+    ]
+
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, f"CLI falhou: {res.stderr}\n{res.stdout}"
+
+    bin_files = list(out_dir.glob("shard_*.bin"))
+    assert len(bin_files) >= 1
+
+    total_tokens = sum(
+        json.loads(p.read_text(encoding="utf-8"))["n_tokens"]
+        for p in out_dir.glob("shard_*.json")
+    )
+    assert total_tokens >= 2000

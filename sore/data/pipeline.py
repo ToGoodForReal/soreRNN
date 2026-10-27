@@ -9,10 +9,17 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator
 
 from sore.data.dedup import MinHashLSH
-from sore.data.filters import filter_document
+from sore.data.filters import (
+    check_alpha_density,
+    check_length,
+    check_line_repetition,
+    check_ngram_repetition,
+    check_pt_stopwords,
+    clean_boilerplate,
+)
 from sore.data.sharder import BinarySharder
 
 logger = logging.getLogger(__name__)
@@ -113,6 +120,8 @@ def run_pipeline(
     min_alpha_ratio: float = 0.70,
     max_line_dup_ratio: float = 0.30,
     max_ngram_dup_ratio: float = 0.20,
+    ngram_size: int = 5,
+    min_pt_stopwords: int = 3,
     pt_sources: set[str] | None = None,
     seed: int = 42,
     show_progress: bool = True,
@@ -122,10 +131,10 @@ def run_pipeline(
 
     Conecta:
     1. WeightedStreamIterator: amostragem probabilística multiplexada;
-    2. filter_document: filtros heurísticos e limpeza de boilerplate;
+    2. clean_boilerplate & filtros: regras heurísticas com detalhamento de causas de rejeição;
     3. MinHashLSH: deduplicação local em streaming;
     4. Tokenizer: conversão de texto higienizado em token IDs uint32;
-    5. BinarySharder: empacotamento contíguo em blocos uint32 com sidecar JSON.
+    5. BinarySharder: empacotamento contíguo em blocos uint32 com sidecar JSON determinístico.
 
     Args:
         sources: Dicionário nome -> iterador/iterável de documentos.
@@ -143,6 +152,8 @@ def run_pipeline(
         min_alpha_ratio: Densidade alfanumérica mínima.
         max_line_dup_ratio: Limite de proporção de linhas duplicadas.
         max_ngram_dup_ratio: Limite de proporção de repetição de n-gramas.
+        ngram_size: Ordem n do n-grama para teste de repetição.
+        min_pt_stopwords: Mínimo de stopwords em português exigidas.
         pt_sources: Conjunto explícito de fontes em português. Se None, detecta automaticamente.
         seed: Semente determinística para geradores pseudo-aleatórios.
         show_progress: Se True e tqdm instalado, exibe barra de progresso.
@@ -159,13 +170,6 @@ def run_pipeline(
 
     if unit_len is None:
         unit_len = 8192 if (shard_size % 8192 == 0) else 1
-
-    sharder = BinarySharder(
-        out_dir=out_dir_path,
-        shard_size=shard_size,
-        eos_id=eos_id,
-        unit_len=unit_len,
-    )
 
     lsh = MinHashLSH(
         capacity=lsh_capacity,
@@ -185,6 +189,13 @@ def run_pipeline(
         "documents_duplicated": 0,
         "documents_accepted": 0,
         "tokens_written": 0,
+        "filter_rejections": {
+            "length": 0,
+            "alpha_density": 0,
+            "line_repetition": 0,
+            "ngram_repetition": 0,
+            "pt_stopwords": 0,
+        },
     }
 
     pbar = None
@@ -195,101 +206,118 @@ def run_pipeline(
         except ImportError:
             pbar = None
 
-    try:
-        for doc in stream:
-            stats["documents_seen"] += 1
+    shards: list[Path] = []
+    with BinarySharder(
+        out_dir=out_dir_path,
+        shard_size=shard_size,
+        eos_id=eos_id,
+        unit_len=unit_len,
+    ) as sharder:
+        try:
+            for doc in stream:
+                stats["documents_seen"] += 1
 
-            # Extração de texto e metadados de fonte
-            if isinstance(doc, dict):
-                text = doc.get("text", "")
-                source_name = doc.get("_source", doc.get("source", "unknown"))
-                if "is_pt" in doc:
-                    is_pt = bool(doc["is_pt"])
-                elif pt_sources is not None:
-                    is_pt = source_name in pt_sources
-                else:
-                    s_lower = str(source_name).lower()
-                    if "pt" in s_lower:
-                        is_pt = True
-                    elif "en" in s_lower or "code" in s_lower:
-                        is_pt = False
+                # Extração de texto com fallbacks de coluna ("text", "content", "raw_content")
+                if isinstance(doc, dict):
+                    text = doc.get("text") or doc.get("content") or doc.get("raw_content") or ""
+                    source_name = doc.get("_source", doc.get("source", "unknown"))
+                    if "is_pt" in doc:
+                        is_pt = bool(doc["is_pt"])
+                    elif pt_sources is not None:
+                        is_pt = source_name in pt_sources
                     else:
-                        is_pt = True
-            elif isinstance(doc, str):
-                text = doc
-                source_name = getattr(stream, "last_source", "unknown")
-                is_pt = True
-            else:
-                text = str(doc)
-                source_name = getattr(stream, "last_source", "unknown")
-                is_pt = True
+                        s_lower = str(source_name).lower()
+                        if "pt" in s_lower:
+                            is_pt = True
+                        elif "en" in s_lower or "code" in s_lower:
+                            is_pt = False
+                        else:
+                            is_pt = True
+                elif isinstance(doc, str):
+                    text = doc
+                    source_name = getattr(stream, "last_source", "unknown")
+                    is_pt = True
+                else:
+                    text = str(doc)
+                    source_name = getattr(stream, "last_source", "unknown")
+                    is_pt = True
 
-            # 1. Filtros Heurísticos de Qualidade e Limpeza de Boilerplate
-            cleaned_text = filter_document(
-                text=text,
-                is_pt=is_pt,
-                min_chars=min_chars,
-                min_words=min_words,
-                min_alpha_ratio=min_alpha_ratio,
-                max_line_dup_ratio=max_line_dup_ratio,
-                max_ngram_dup_ratio=max_ngram_dup_ratio,
-            )
+                if not text:
+                    stats["documents_filtered"] += 1
+                    stats["filter_rejections"]["length"] += 1
+                    continue
 
-            if cleaned_text is None:
-                stats["documents_filtered"] += 1
-                continue
+                # 1. Filtros Heurísticos de Qualidade com rastreamento detalhado de rejeições
+                cleaned_text = clean_boilerplate(text)
 
-            # 2. Deduplicação Local em Janela Deslizante (MinHash LSH)
-            if lsh.is_duplicate_and_insert(cleaned_text):
-                stats["documents_duplicated"] += 1
-                continue
+                rejection_reason = None
+                if not check_length(cleaned_text, min_chars=min_chars, min_words=min_words):
+                    rejection_reason = "length"
+                elif not check_alpha_density(cleaned_text, min_ratio=min_alpha_ratio):
+                    rejection_reason = "alpha_density"
+                elif not check_line_repetition(cleaned_text, max_ratio=max_line_dup_ratio):
+                    rejection_reason = "line_repetition"
+                elif not check_ngram_repetition(cleaned_text, n=ngram_size, max_ratio=max_ngram_dup_ratio):
+                    rejection_reason = "ngram_repetition"
+                elif is_pt and not check_pt_stopwords(cleaned_text, min_count=min_pt_stopwords):
+                    rejection_reason = "pt_stopwords"
 
-            # 3. Tokenização
-            if hasattr(tokenizer, "encode"):
-                encoded = tokenizer.encode(cleaned_text)
-            elif callable(tokenizer):
-                encoded = tokenizer(cleaned_text)
-            else:
-                raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
+                if rejection_reason is not None:
+                    stats["documents_filtered"] += 1
+                    stats["filter_rejections"][rejection_reason] += 1
+                    continue
 
-            if hasattr(encoded, "ids"):
-                token_ids = encoded.ids
-            elif isinstance(encoded, dict) and "input_ids" in encoded:
-                token_ids = encoded["input_ids"]
-            else:
-                token_ids = encoded
+                # 2. Deduplicação Local em Janela Deslizante (MinHash LSH)
+                if lsh.is_duplicate_and_insert(cleaned_text):
+                    stats["documents_duplicated"] += 1
+                    continue
 
-            if not token_ids:
-                continue
+                # 3. Tokenização
+                if hasattr(tokenizer, "encode"):
+                    encoded = tokenizer.encode(cleaned_text)
+                elif callable(tokenizer):
+                    encoded = tokenizer(cleaned_text)
+                else:
+                    raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
-            # 4. Verificação de Limite de Tokens e Gravação em Shards
-            remaining_tokens = max_tokens - stats["tokens_written"]
-            if remaining_tokens <= 0:
-                break
+                if hasattr(encoded, "ids"):
+                    token_ids = encoded.ids
+                elif isinstance(encoded, dict) and "input_ids" in encoded:
+                    token_ids = encoded["input_ids"]
+                else:
+                    token_ids = encoded
 
-            doc_len = len(token_ids) + 1  # tokens do documento + eos_id
-            if doc_len > remaining_tokens:
-                take_tokens = max(0, remaining_tokens - 1)
-                token_ids = token_ids[:take_tokens]
-                doc_tokens_to_add = take_tokens + 1
-            else:
-                doc_tokens_to_add = doc_len
+                if not token_ids:
+                    continue
 
-            sharder.add_document(token_ids, source_name=source_name)
-            stats["documents_accepted"] += 1
-            stats["tokens_written"] += doc_tokens_to_add
+                # 4. Verificação de Limite de Tokens e Gravação em Shards
+                remaining_tokens = max_tokens - stats["tokens_written"]
+                if remaining_tokens <= 0:
+                    break
 
+                doc_len = len(token_ids) + 1  # tokens do documento + eos_id
+                if doc_len > remaining_tokens:
+                    take_tokens = max(0, remaining_tokens - 1)
+                    token_ids = token_ids[:take_tokens]
+                    doc_tokens_to_add = take_tokens + 1
+                else:
+                    doc_tokens_to_add = doc_len
+
+                sharder.add_document(token_ids, source_name=source_name)
+                stats["documents_accepted"] += 1
+                stats["tokens_written"] += doc_tokens_to_add
+
+                if pbar is not None:
+                    pbar.update(doc_tokens_to_add)
+
+                if stats["tokens_written"] >= max_tokens:
+                    break
+
+        finally:
             if pbar is not None:
-                pbar.update(doc_tokens_to_add)
+                pbar.close()
 
-            if stats["tokens_written"] >= max_tokens:
-                break
-
-    finally:
-        if pbar is not None:
-            pbar.close()
-
-    shards = sharder.close()
+        shards = sharder.close()
 
     if return_stats:
         return shards, stats
