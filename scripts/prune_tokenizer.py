@@ -1,7 +1,6 @@
 """CLI para poda de tokenizador BPE e exportação para HuggingFace com tensores de destilação."""
 
 import argparse
-import sys
 
 from sore.data.prune_tokenizer import export_pruned_tokenizer
 

@@ -301,5 +301,117 @@ def test_prune_tokenizer_cli(tmp_path):
     assert (out_dir / "remapping.pt").exists()
 
 
+def test_export_pruned_tokenizer_missing_frequencies_file(tmp_path):
+    import pytest
+    import json
+
+    # Configuração mínima
+    bytes_tokens = {f"<0x{i:02X}>": i for i in range(256)}
+    vocab = dict(bytes_tokens)
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    with open(source_dir / "tokenizer.json", "w", encoding="utf-8") as f:
+        json.dump({"version": "1.0", "model": {"type": "BPE", "vocab": vocab, "merges": []}}, f)
+
+    with pytest.raises(FileNotFoundError, match="Arquivo de frequências não encontrado"):
+        export_pruned_tokenizer(
+            source_tokenizer_path=str(source_dir),
+            output_dir=str(tmp_path / "dst"),
+            target_size=256,
+            frequencies_path=str(tmp_path / "inexistente.json"),
+        )
+
+
+def test_export_pruned_tokenizer_unsupported_extension(tmp_path):
+    import pytest
+    import json
+
+    bytes_tokens = {f"<0x{i:02X}>": i for i in range(256)}
+    vocab = dict(bytes_tokens)
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    with open(source_dir / "tokenizer.json", "w", encoding="utf-8") as f:
+        json.dump({"version": "1.0", "model": {"type": "BPE", "vocab": vocab, "merges": []}}, f)
+
+    bad_freqs = tmp_path / "freqs.txt"
+    bad_freqs.write_text("dummy", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Extensão de arquivo de frequências não suportada"):
+        export_pruned_tokenizer(
+            source_tokenizer_path=str(source_dir),
+            output_dir=str(tmp_path / "dst"),
+            target_size=256,
+            frequencies_path=str(bad_freqs),
+        )
+
+
+def test_export_pruned_tokenizer_pt_dict_frequencies(tmp_path):
+    import json
+    import torch
+    from tokenizers import Tokenizer
+
+    bytes_tokens = {f"<0x{i:02X}>": i for i in range(256)}
+    vocab = dict(bytes_tokens)
+    vocab["a"] = 256
+    vocab["b"] = 257
+    vocab["c"] = 258
+    vocab["ab"] = 259
+    vocab["abc"] = 260
+    vocab["unused_tok"] = 261
+    vocab["<|endoftext|>"] = 262
+
+    merges = [("a", "b"), ("ab", "c")]
+    merges_str = [f"{l} {r}" for l, r in merges]
+
+    tokenizer_data = {
+        "version": "1.0",
+        "added_tokens": [
+            {
+                "id": 262,
+                "content": "<|endoftext|>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+        ],
+        "model": {
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": merges_str,
+        },
+    }
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    with open(source_dir / "tokenizer.json", "w", encoding="utf-8") as f:
+        json.dump(tokenizer_data, f)
+
+    # Salva frequências em .pt com chaves int (IDs originais)
+    pt_freqs_path = tmp_path / "freqs.pt"
+    # vocab["abc"] = 260, vocab["unused_tok"] = 261
+    torch.save({260: 100, 261: 1}, pt_freqs_path)
+
+    out_dir = tmp_path / "dst"
+    target_size = 262  # 256 bytes + 5 (a, b, c, ab, abc) + 1 (<|endoftext|>)
+
+    export_pruned_tokenizer(
+        source_tokenizer_path=str(source_dir),
+        output_dir=str(out_dir),
+        target_size=target_size,
+        frequencies_path=str(pt_freqs_path),
+    )
+
+    reloaded = Tokenizer.from_file(str(out_dir / "tokenizer.json"))
+    assert reloaded.get_vocab_size(with_added_tokens=True) == target_size
+    remap = torch.load(out_dir / "remapping.pt")
+    old_to_new = remap["old_to_new"]
+    # "abc" foi mantido e "unused_tok" foi descartado (-1)
+    assert old_to_new[vocab["abc"]] != -1
+    assert old_to_new[vocab["unused_tok"]] == -1
+
+
+
 
 

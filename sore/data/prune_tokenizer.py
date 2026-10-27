@@ -376,8 +376,11 @@ def export_pruned_tokenizer(
 
     # Leitura opcional de frequências
     frequencies: dict[str, int] = {}
-    if frequencies_path is not None and os.path.exists(frequencies_path):
+    if frequencies_path is not None:
         freq_p = Path(frequencies_path)
+        if not freq_p.exists():
+            raise FileNotFoundError(f"Arquivo de frequências não encontrado: {frequencies_path}")
+
         if freq_p.suffix == ".json":
             with open(freq_p, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -385,7 +388,7 @@ def export_pruned_tokenizer(
                 for k, v in loaded.items():
                     if k in old_vocab:
                         frequencies[k] = int(v)
-                    elif k.isdigit():
+                    elif isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
                         token_id = int(k)
                         if token_id < len(full_vocab):
                             frequencies[full_vocab[token_id]] = int(v)
@@ -402,7 +405,12 @@ def export_pruned_tokenizer(
                         frequencies[full_vocab[token_id]] = int(v)
             elif isinstance(loaded, dict):
                 for k, v in loaded.items():
-                    frequencies[str(k)] = int(v)
+                    if isinstance(k, str) and k in old_vocab:
+                        frequencies[k] = int(v)
+                    elif isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
+                        token_id = int(k)
+                        if token_id < len(full_vocab):
+                            frequencies[full_vocab[token_id]] = int(v)
         elif freq_p.suffix == ".npy":
             import numpy as np
 
@@ -410,6 +418,8 @@ def export_pruned_tokenizer(
             for token_id, v in enumerate(counts):
                 if token_id < len(full_vocab):
                     frequencies[full_vocab[token_id]] = int(v)
+        else:
+            raise ValueError(f"Extensão de arquivo de frequências não suportada: {freq_p.suffix}")
 
     # Seleção gulosa fechada sob merges BPE
     selected_vocab, pruned_merges = select_pruned_vocab(
