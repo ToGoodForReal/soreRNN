@@ -2,7 +2,9 @@
 
 from sore.data.prune_tokenizer import (
     build_dependency_graph,
+    build_remapping_tensors,
     compute_ancestors,
+    export_pruned_tokenizer,
     is_merge_closed,
     select_pruned_vocab,
 )
@@ -134,5 +136,170 @@ def test_select_pruned_vocab_zero_frequencies_use_residual_filling():
     assert "a" in selected_vocab
     assert "b" not in selected_vocab
     assert is_merge_closed(selected_vocab, pruned_merges)
+
+
+def test_build_remapping_tensors():
+    import torch
+
+    old_vocab = {"<0x00>": 0, "a": 1, "b": 2, "unused": 3, "<|endoftext|>": 4}
+    new_vocab = {"<0x00>": 0, "a": 1, "b": 2, "<|endoftext|>": 3}
+    new_to_old, old_to_new = build_remapping_tensors(old_vocab, new_vocab)
+
+    assert new_to_old.shape == (4,)
+    assert old_to_new.shape == (5,)
+    assert new_to_old.tolist() == [0, 1, 2, 4]
+    assert old_to_new[0] == 0 and old_to_new[1] == 1 and old_to_new[2] == 2
+    assert old_to_new[3] == -1  # descarte
+    assert old_to_new[4] == 3
+    # Invariante de destilação
+    for new_id in range(len(new_vocab)):
+        assert old_to_new[new_to_old[new_id]] == new_id
+
+
+def test_export_pruned_tokenizer(tmp_path):
+    import json
+    import torch
+    from tokenizers import Tokenizer
+
+    # Criar um tokenizer fonte sintético no formato HuggingFace
+    bytes_tokens = {f"<0x{i:02X}>": i for i in range(256)}
+    # Adicionar tokens compostos e especiais
+    vocab = dict(bytes_tokens)
+    vocab["a"] = 256
+    vocab["b"] = 257
+    vocab["c"] = 258
+    vocab["ab"] = 259
+    vocab["abc"] = 260
+    vocab["unused_tok"] = 261
+    vocab["<|endoftext|>"] = 262
+
+    merges = [("a", "b"), ("ab", "c")]
+    merges_str = [f"{l} {r}" for l, r in merges]
+
+    tokenizer_data = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {
+                "id": 262,
+                "content": "<|endoftext|>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+        ],
+        "normalizer": None,
+        "pre_tokenizer": None,
+        "post_processor": None,
+        "decoder": None,
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "vocab": vocab,
+            "merges": merges_str,
+        },
+    }
+
+    source_dir = tmp_path / "source_tok"
+    source_dir.mkdir()
+    with open(source_dir / "tokenizer.json", "w", encoding="utf-8") as f:
+        json.dump(tokenizer_data, f)
+    with open(source_dir / "tokenizer_config.json", "w", encoding="utf-8") as f:
+        json.dump({"eos_token": "<|endoftext|>", "vocab_size": 263}, f)
+    with open(source_dir / "special_tokens_map.json", "w", encoding="utf-8") as f:
+        json.dump({"eos_token": "<|endoftext|>"}, f)
+
+    # Frequências: preferir "abc" (e transitivamente "ab", "a", "b", "c") sobre "unused_tok"
+    freqs_path = tmp_path / "freqs.json"
+    with open(freqs_path, "w", encoding="utf-8") as f:
+        json.dump({"abc": 100, "unused_tok": 1}, f)
+
+    out_dir = tmp_path / "pruned_tok"
+    target_size = 262  # 256 bytes + "a" + "b" + "c" + "ab" + "abc" + "<|endoftext|>" = 262 tokens (elimina unused_tok)
+
+    export_pruned_tokenizer(
+        source_tokenizer_path=str(source_dir),
+        output_dir=str(out_dir),
+        target_size=target_size,
+        frequencies_path=str(freqs_path),
+    )
+
+    # Verificar existência de todos os arquivos
+    assert (out_dir / "tokenizer.json").exists()
+    assert (out_dir / "tokenizer_config.json").exists()
+    assert (out_dir / "special_tokens_map.json").exists()
+    assert (out_dir / "remapping.pt").exists()
+
+    # Verificar carregamento pelo tokenizers HF
+    reloaded = Tokenizer.from_file(str(out_dir / "tokenizer.json"))
+    assert reloaded.get_vocab_size(with_added_tokens=True) == target_size
+
+    # Verificar remapping.pt
+    remap = torch.load(out_dir / "remapping.pt")
+    new_to_old = remap["new_to_old"]
+    old_to_new = remap["old_to_new"]
+    assert new_to_old.shape == (target_size,)
+    assert old_to_new.shape == (263,)
+    assert old_to_new[vocab["unused_tok"]] == -1  # descartado
+
+    # Invariante de destilação
+    for new_id in range(target_size):
+        assert old_to_new[new_to_old[new_id]] == new_id
+
+    # <|endoftext|> deve estar na posição final (target_size - 1)
+    assert reloaded.token_to_id("<|endoftext|>") == target_size - 1
+    assert old_to_new[vocab["<|endoftext|>"]] == target_size - 1
+
+
+def test_prune_tokenizer_cli(tmp_path):
+    import json
+    from scripts.prune_tokenizer import main as cli_main
+
+    # Criar tokenizer fonte sintético
+    bytes_tokens = {f"<0x{i:02X}>": i for i in range(256)}
+    vocab = dict(bytes_tokens)
+    vocab["extra"] = 256
+    vocab["<|endoftext|>"] = 257
+
+    tokenizer_data = {
+        "version": "1.0",
+        "added_tokens": [
+            {
+                "id": 257,
+                "content": "<|endoftext|>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+        ],
+        "model": {
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": [],
+        },
+    }
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    with open(source_dir / "tokenizer.json", "w", encoding="utf-8") as f:
+        json.dump(tokenizer_data, f)
+
+    out_dir = tmp_path / "dst"
+    cli_main(["--source", str(source_dir), "--out", str(out_dir), "--target-size", "257"])
+
+    assert (out_dir / "tokenizer.json").exists()
+    assert (out_dir / "remapping.pt").exists()
+
+
 
 
