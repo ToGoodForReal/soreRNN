@@ -4,10 +4,12 @@ from sore.data.prune_tokenizer import (
     build_dependency_graph,
     compute_ancestors,
     is_merge_closed,
+    select_pruned_vocab,
 )
 
 __all__ = [
     "build_dependency_graph",
     "compute_ancestors",
     "is_merge_closed",
+    "select_pruned_vocab",
 ]

@@ -4,6 +4,7 @@ from sore.data.prune_tokenizer import (
     build_dependency_graph,
     compute_ancestors,
     is_merge_closed,
+    select_pruned_vocab,
 )
 
 
@@ -60,3 +61,53 @@ def test_memoization_avoids_recomputation():
     # Chamada repetida deve retornar o memoizado
     anc2 = compute_ancestors("xyz", graph, memo)
     assert anc2 is anc1
+
+
+def test_select_pruned_vocab_exact_size_and_closure():
+    # Vocabulario sintético com bytes, especiais e compostos
+    bytes_tokens = {f"<0x{i:02X}>" for i in range(256)}
+    special_tokens = {"<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"}
+    protected = bytes_tokens | special_tokens
+
+    # Merges: ("<0x61>", "<0x62>") -> "ab", ("ab", "<0x63>") -> "abc", ("<0x64>", "<0x65>") -> "de"
+    full_merges = [("<0x61>", "<0x62>"), ("ab", "<0x63>"), ("<0x64>", "<0x65>")]
+    full_vocab = list(protected) + ["ab", "abc", "de"]
+    freqs = {"abc": 100, "de": 50, "ab": 10}
+
+    target_size = len(protected) + 2  # Cabe protected + "ab" e "abc" (custo total 2), mas não "de"
+    selected_vocab, pruned_merges = select_pruned_vocab(
+        freqs, full_vocab, full_merges, protected, target_size=target_size
+    )
+    assert len(selected_vocab) == target_size
+    assert protected.issubset(selected_vocab)
+    assert "ab" in selected_vocab and "abc" in selected_vocab
+    assert is_merge_closed(selected_vocab, pruned_merges)
+
+
+def test_select_pruned_vocab_invalid_target_size():
+    import pytest
+
+    protected = {"<0x00>", "<0x01>"}
+    full_vocab = ["<0x00>", "<0x01>", "a"]
+    # target_size menor que conjunto protegido
+    with pytest.raises(ValueError, match="menor"):
+        select_pruned_vocab({}, full_vocab, [], protected, target_size=1)
+    # target_size maior que vocabulário completo
+    with pytest.raises(ValueError, match="maior"):
+        select_pruned_vocab({}, full_vocab, [], protected, target_size=10)
+
+
+def test_select_pruned_vocab_residual_filling():
+    protected = {"<0x00>", "<0x01>"}
+    # Merges: ("<0x00>", "<0x01>") -> "x", ("x", "<0x00>") -> "xx"
+    merges = [("<0x00>", "<0x01>"), ("x", "<0x00>")]
+    full_vocab = ["<0x00>", "<0x01>", "x", "xx", "y"]
+    # Sem frequências para "x", apenas "y" tem frequência mas target_size permite todos
+    freqs = {"y": 10}
+    selected_vocab, pruned_merges = select_pruned_vocab(
+        freqs, full_vocab, merges, protected, target_size=4
+    )
+    assert len(selected_vocab) == 4
+    assert protected.issubset(selected_vocab)
+    assert is_merge_closed(selected_vocab, pruned_merges)
+
