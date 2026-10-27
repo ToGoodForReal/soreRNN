@@ -13,6 +13,10 @@ from sore.data.filters import (
     clean_boilerplate,
     filter_document,
 )
+from sore.data.pipeline import (
+    WeightedStreamIterator,
+    run_pipeline,
+)
 from sore.data.prune_tokenizer import (
     build_dependency_graph,
     build_remapping_tensors,
@@ -26,6 +30,7 @@ from sore.data.sharder import BinarySharder
 __all__ = [
     "BinarySharder",
     "MinHashLSH",
+    "WeightedStreamIterator",
     "build_dependency_graph",
     "build_remapping_tensors",
     "check_alpha_density",
@@ -39,5 +44,6 @@ __all__ = [
     "export_pruned_tokenizer",
     "filter_document",
     "is_merge_closed",
+    "run_pipeline",
     "select_pruned_vocab",
 ]
