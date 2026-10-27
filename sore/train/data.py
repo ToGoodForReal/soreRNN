@@ -28,6 +28,9 @@ class Batch:
     labels: torch.Tensor
     cu_seqlens: torch.Tensor
 
+    def __len__(self) -> int:
+        return self.input_ids.shape[-1]
+
 
 def write_token_shard(path: Path, tokens: np.ndarray) -> None:
     """Grava `tokens` como uint32 little-endian cru e o sidecar `.json` ao lado."""
@@ -215,3 +218,83 @@ class PackedTokenStream:
         self.position = d["position"]
         self.tokens_consumed = d["tokens_consumed"]
         self._perm = self._permutation()
+
+
+class StreamDataset:
+    """Interface streaming de alto nível para carregar shards contíguos de tokens uint32.
+
+    Compatível com shards produzidos por `BinarySharder` (`sore.data.sharder`),
+    permitindo iteração sequencial e consumo por janelas (`next_window`).
+
+    Parâmetros:
+        paths: Lista de caminhos ou caminho individual dos arquivos binários de shard.
+        seq_len: Comprimento da janela de tokens retornada (padrão: 4096).
+        unit_len: Tamanho da unidade de empacotamento nos shards (padrão: 8192).
+        seed: Semente determinística para o cursor do stream (padrão: 42).
+        eos_id: ID do token de fim de documento; se None, deduz do sidecar JSON do shard (padrão: None).
+        micro_batch: Quantidade de janelas por lote interno (padrão: 1).
+    """
+
+    def __init__(
+        self,
+        paths: list[str | Path] | str | Path,
+        seq_len: int = 4096,
+        unit_len: int = 8192,
+        seed: int = 42,
+        eos_id: int | None = None,
+        micro_batch: int = 1,
+    ) -> None:
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+        self.paths = [Path(p) for p in paths]
+        if not self.paths:
+            raise ValueError("é preciso ao menos um shard")
+
+        if eos_id is None:
+            sidecar = self.paths[0].with_suffix(".json")
+            if sidecar.exists():
+                try:
+                    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+                    eos_id = meta.get("eos_id", 0)
+                except Exception:
+                    eos_id = 0
+            else:
+                eos_id = 0
+
+        self.eos_id = int(eos_id)
+        self.seq_len = int(seq_len)
+        self.unit_len = int(unit_len)
+        self.micro_batch = int(micro_batch)
+        self.seed = int(seed)
+
+        self._stream = PackedTokenStream(
+            paths=self.paths,
+            seq_len=self.seq_len,
+            micro_batch=self.micro_batch,
+            eos_id=self.eos_id,
+            seed=self.seed,
+            unit_len=self.unit_len,
+        )
+
+    @property
+    def n_tokens(self) -> int:
+        """Quantidade total de tokens agregada em todos os shards carregados."""
+        return self._stream._n_tokens
+
+    def next_window(self) -> torch.Tensor:
+        """Avança o stream e retorna a próxima janela de `seq_len` tokens como tensor 1D."""
+        batch = next(self._stream)
+        return batch.input_ids[0]
+
+    def __iter__(self) -> StreamDataset:
+        return self
+
+    def __next__(self) -> Batch:
+        return next(self._stream)
+
+    def state_dict(self) -> dict:
+        return self._stream.state_dict()
+
+    def load_state_dict(self, state: dict) -> None:
+        self._stream.load_state_dict(state)
+

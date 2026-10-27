@@ -306,3 +306,175 @@ def test_prepare_data_cli_procedural_mock_large_volume(tmp_path: Path):
         for p in out_dir.glob("shard_*.json")
     )
     assert total_tokens >= 2000
+
+
+def test_stream_dataset_reads_generated_shards(tmp_path: Path):
+    from sore.data.sharder import BinarySharder
+    from sore.train.data import StreamDataset
+
+    sharder = BinarySharder(tmp_path, shard_size=16384, eos_id=98303, unit_len=8192)
+    sharder.add_document([10] * 8191)  # fecha 8192 com eos_id
+    sharder.add_document([20] * 8191)  # fecha 16384 com eos_id
+    shards = sharder.close()
+
+    ds = StreamDataset([str(s) for s in shards], seq_len=4096, unit_len=8192, seed=42)
+    batch = ds.next_window()
+    assert len(batch) == 4096
+    assert ds.n_tokens == 16384
+
+
+def test_eval_fertility_calculation():
+    from scripts.eval_fertility import calculate_fertility, evaluate_fertility
+
+    class WordFixedTokenizer:
+        def __init__(self, tokens_per_sentence: int):
+            self.tokens_per_sentence = tokens_per_sentence
+
+        def encode(self, text: str) -> list[int]:
+            return [1] * self.tokens_per_sentence
+
+    # 2 sentenças com 5 palavras cada = 10 palavras no total
+    texts = [
+        "palavra um dois tres quatro",
+        "outra frase com cinco palavras",
+    ]
+
+    # Base: 10 tokens no total (10 / 10 = 1.0)
+    base_tok = WordFixedTokenizer(5)
+    # Pruned: 10.2 tokens equivalente -> 5 e 5 com extra ou 10 vs 10 (+0%)
+    pruned_tok_pass = WordFixedTokenizer(5)  # razão 1.00 <= 1.03
+    res_pass = evaluate_fertility(base_tok, pruned_tok_pass, texts, max_degradation=0.03)
+    assert res_pass["passed"] is True
+    assert res_pass["ratio"] == pytest.approx(1.0, rel=1e-5)
+    assert res_pass["degradation_pct"] == pytest.approx(0.0, rel=1e-5)
+    assert res_pass["num_sentences"] == 2
+
+
+def test_eval_fertility_degradation_exceeded():
+    from scripts.eval_fertility import evaluate_fertility
+
+    class WordFixedTokenizer:
+        def __init__(self, tokens_per_sentence: int):
+            self.tokens_per_sentence = tokens_per_sentence
+
+        def encode(self, text: str) -> list[int]:
+            return [1] * self.tokens_per_sentence
+
+    texts = [
+        "palavra um dois tres quatro cinco seis sete oito nove dez",
+    ]  # 10 palavras
+
+    base_tok = WordFixedTokenizer(10)      # fertilidade = 1.0
+    pruned_tok = WordFixedTokenizer(11)    # fertilidade = 1.1 (+10% degradação > 3%)
+
+    res = evaluate_fertility(base_tok, pruned_tok, texts, max_degradation=0.03)
+    assert res["passed"] is False
+    assert res["ratio"] == pytest.approx(1.10, rel=1e-5)
+    assert res["degradation_pct"] == pytest.approx(10.0, rel=1e-5)
+
+
+def test_eval_fertility_cli(tmp_path: Path):
+    import subprocess
+    import sys
+    import json
+    from sore.data.prune_tokenizer import export_pruned_tokenizer
+
+    source_dir = tmp_path / "source_tok"
+    source_dir.mkdir()
+
+    vocab = {f"<byte_{i}>": i for i in range(256)}
+    vocab["<|endoftext|>"] = 256
+    vocab["a"] = 257
+    vocab["b"] = 258
+    vocab["c"] = 259
+    vocab["ab"] = 260
+    vocab["abc"] = 261
+    vocab[" "] = 262
+
+    merges = [("a", "b"), ("ab", "c")]
+    merges_str = [f"{l} {r}" for l, r in merges]
+
+    tok_data = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {
+                "id": 256,
+                "content": "<|endoftext|>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+        ],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "vocab": vocab,
+            "merges": merges_str,
+        },
+    }
+
+    (source_dir / "tokenizer.json").write_text(json.dumps(tok_data), encoding="utf-8")
+    (source_dir / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "Qwen2TokenizerFast"}),
+        encoding="utf-8",
+    )
+
+    pruned_dir = tmp_path / "pruned_tok"
+    export_pruned_tokenizer(str(source_dir), str(pruned_dir), target_size=259)
+
+    # Cria arquivo de texto de teste compatível com o vocabulário sintético
+    test_text_file = tmp_path / "sample_pt.txt"
+    test_text_file.write_text("a b c ab abc\na b c\n", encoding="utf-8")
+
+    # Executa CLI com arquivo de texto
+    cmd = [
+        sys.executable,
+        "scripts/eval_fertility.py",
+        "--base-tokenizer",
+        str(source_dir),
+        "--pruned-tokenizer",
+        str(pruned_dir),
+        "--text-file",
+        str(test_text_file),
+        "--max-sentences",
+        "5",
+        "--assert-ratio",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, f"CLI falhou: {res.stderr}\n{res.stdout}"
+    assert "RELATÓRIO DE FERTILIDADE EM PORTUGUÊS" in res.stdout
+    assert "APROVADO" in res.stdout
+
+
+def test_eval_fertility_cli_mock():
+    import subprocess
+    import sys
+
+    cmd = [
+        sys.executable,
+        "scripts/eval_fertility.py",
+        "--mock",
+        "--sample-pt",
+        "--max-sentences",
+        "10",
+        "--assert-ratio",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, f"CLI mock falhou: {res.stderr}\n{res.stdout}"
+    assert "MockBaseTokenizer" in res.stdout
+    assert "MockPrunedTokenizer" in res.stdout
+    assert "RELATÓRIO DE FERTILIDADE EM PORTUGUÊS" in res.stdout
+    assert "APROVADO" in res.stdout
