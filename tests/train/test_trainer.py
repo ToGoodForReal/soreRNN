@@ -713,7 +713,8 @@ def test_b0_8_config_values():
     cfg = load_train_config(REPO / "configs" / "b0_8_pretrain.yaml")
     assert cfg.stages == [Stage(35_000_000_000, 4096, 2), Stage(50_000_000_000, 8192, 1)]
     assert (cfg.total_tokens, cfg.grad_accum, cfg.compile) == (50_000_000_000, 64, True)
-    assert cfg.model_overrides == {"grad_checkpoint": True}
+    assert cfg.model_overrides == {"grad_checkpoint": True, "vocab_size": 98304}
+    assert cfg.eos_id == 98303
     # R27: last.pt a cada 5e7 tokens (~95 passos) e 4 snapshots numerados, um a cada 2,5e9
     assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens, cfg.keep_snapshots) == (50_000_000, 2_500_000_000, 4)
 

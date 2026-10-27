@@ -104,8 +104,6 @@ def count_tokens(tokenizer: Any, text: str) -> int:
     encoded = tokenizer.encode(text)
     if hasattr(encoded, "ids"):
         return len(encoded.ids)
-    if isinstance(encoded, list):
-        return len(encoded)
     return len(encoded)
 
 

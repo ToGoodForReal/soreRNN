@@ -322,6 +322,11 @@ def test_stream_dataset_reads_generated_shards(tmp_path: Path):
     assert len(batch) == 4096
     assert ds.n_tokens == 16384
 
+    # Expansão de glob standalone (* e ?)
+    ds_glob = StreamDataset(str(tmp_path / "shard_*.bin"), seq_len=4096, unit_len=8192, seed=42)
+    assert len(ds_glob.paths) == len(shards)
+    assert ds_glob.n_tokens == 16384
+
 
 def test_eval_fertility_calculation():
     from scripts.eval_fertility import calculate_fertility, evaluate_fertility
@@ -478,3 +483,54 @@ def test_eval_fertility_cli_mock():
     assert "MockPrunedTokenizer" in res.stdout
     assert "RELATÓRIO DE FERTILIDADE EM PORTUGUÊS" in res.stdout
     assert "APROVADO" in res.stdout
+
+
+def test_weighted_stream_iterator_does_not_mutate_input_dict():
+    orig_doc = {"text": "hello world"}
+    src = [orig_doc]
+    mux = WeightedStreamIterator({"s1": src}, {"s1": 1.0})
+    item = next(mux)
+    assert item["_source"] == "s1"
+    # O dict original fornecido pelo chamador NÃO deve ter sido mutado in-place
+    assert "_source" not in orig_doc
+
+
+def test_pipeline_source_language_resolution(tmp_path: Path):
+    # Documentos em inglês/código que não devem ser rejeitados por stopwords de PT
+    # mesmo que o nome da fonte contenha substrings como 'pt' em 'python_scripts' ou 'opt'
+    code_doc_1 = (
+        "def compute_evaluation_metrics(predictions: list[float], targets: list[float]) -> dict[str, float]:\n"
+        "    squared_errors = [(pred - target) ** 2 for pred, target in zip(predictions, targets)]\n"
+        "    mean_squared_error = sum(squared_errors) / max(len(squared_errors), 1)\n"
+        "    root_mean_squared_error = mean_squared_error ** 0.5\n"
+        "    absolute_errors = [abs(pred - target) for pred, target in zip(predictions, targets)]\n"
+        "    mean_absolute_error = sum(absolute_errors) / max(len(absolute_errors), 1)\n"
+        "    return {'rmse': root_mean_squared_error, 'mae': mean_absolute_error}\n"
+    )
+    code_doc_2 = (
+        "def compute_classification_accuracy(logits: list[list[float]], labels: list[int]) -> float:\n"
+        "    correct_predictions = 0\n"
+        "    for sample_logits, target_label in zip(logits, labels):\n"
+        "        predicted_class = max(range(len(sample_logits)), key=lambda idx: sample_logits[idx])\n"
+        "        if predicted_class == target_label:\n"
+        "            correct_predictions += 1\n"
+        "    return correct_predictions / max(len(labels), 1)\n"
+    )
+    sources = {
+        "python_scripts": [{"text": code_doc_1}],
+        "opt_benchmarks": [{"text": code_doc_2}],
+    }
+    tokenizer = MockTokenizer()
+    shards, stats = run_pipeline(
+        sources=sources,
+        tokenizer=tokenizer,
+        out_dir=tmp_path / "shards_lang",
+        max_tokens=1000,
+        shard_size=1024,
+        unit_len=1,
+        return_stats=True,
+    )
+    # Não deve ter sido rejeitado pelo filtro de pt_stopwords
+    assert stats["filter_rejections"]["pt_stopwords"] == 0
+    assert stats["documents_accepted"] == 2
+

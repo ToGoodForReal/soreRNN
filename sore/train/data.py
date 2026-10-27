@@ -10,6 +10,7 @@ O stream sorteia unidades fixas de `unit_len` tokens por uma permutação determ
 """
 from __future__ import annotations
 
+import glob
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -246,7 +247,15 @@ class StreamDataset:
     ) -> None:
         if isinstance(paths, (str, Path)):
             paths = [paths]
-        self.paths = [Path(p) for p in paths]
+        resolved_paths: list[Path] = []
+        for p in paths:
+            p_str = str(p)
+            if "*" in p_str or "?" in p_str:
+                matches = sorted(glob.glob(p_str))
+                resolved_paths.extend(Path(m) for m in matches)
+            else:
+                resolved_paths.append(Path(p))
+        self.paths = resolved_paths
         if not self.paths:
             raise ValueError("é preciso ao menos um shard")
 

@@ -93,6 +93,7 @@ class WeightedStreamIterator:
                 self.last_source = chosen_source
 
                 if isinstance(item, dict):
+                    item = dict(item)
                     if "_source" not in item:
                         item["_source"] = chosen_source
 
@@ -227,9 +228,14 @@ def run_pipeline(
                         is_pt = source_name in pt_sources
                     else:
                         s_lower = str(source_name).lower()
-                        if "pt" in s_lower:
+                        if (
+                            s_lower.startswith(("pt_", "pt-", "por_"))
+                            or s_lower == "pt"
+                            or "_pt_" in s_lower
+                            or s_lower.endswith(("_pt", "-pt"))
+                        ):
                             is_pt = True
-                        elif "en" in s_lower or "code" in s_lower:
+                        elif "en" in s_lower or "code" in s_lower or "math" in s_lower or "python" in s_lower:
                             is_pt = False
                         else:
                             is_pt = True
@@ -317,7 +323,7 @@ def run_pipeline(
             if pbar is not None:
                 pbar.close()
 
-        shards = sharder.close()
+    shards = sharder.written_shards
 
     if return_stats:
         return shards, stats

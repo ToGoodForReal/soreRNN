@@ -136,8 +136,7 @@ def check_ngram_repetition(text: str, n: int = 5, max_ratio: float = 0.20) -> bo
     if len(words) < n:
         return True
     total_ngrams = len(words) - n + 1
-    ngrams = [tuple(words[i : i + n]) for i in range(total_ngrams)]
-    unique_ngrams = len(set(ngrams))
+    unique_ngrams = len({tuple(words[i : i + n]) for i in range(total_ngrams)})
     duplicate_ratio = (total_ngrams - unique_ngrams) / total_ngrams
     return duplicate_ratio <= max_ratio
 
