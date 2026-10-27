@@ -180,4 +180,40 @@ def test_b0_8_fp8_ab_configs_load():
         assert cfg.stages[0].micro_batch == 2
 
 
+def test_summarize_bench_flags_non_finite_grads(tmp_path: Path):
+    """Testa que corridas com finite_grads=False são marcadas como inválidas e ignoradas no best-exact."""
+    from scripts.summarize_bench import find_best_exact, summarize_bench
+
+    bench_file = tmp_path / "bench.jsonl"
+    e_nan = {
+        "preset": "b0_8",
+        "seq_len": 4096,
+        "micro_batch": 2,
+        "tok_s": 17600.0,
+        "mfu": 0.58,
+        "fp8": "tensorwise",
+        "finite_grads": False,
+    }
+    e_valid = {
+        "preset": "b0_8",
+        "seq_len": 4096,
+        "micro_batch": 2,
+        "tok_s": 14720.0,
+        "mfu": 0.489,
+        "fp8": "off",
+        "finite_grads": True,
+    }
+    with bench_file.open("w") as f:
+        f.write(json.dumps(e_nan) + "\n")
+        f.write(json.dumps(e_valid) + "\n")
+
+    table = summarize_bench(bench_file)
+    assert "**INVÁLIDO (grad norm NaN)**" in table
+
+    best = find_best_exact(bench_file, 4096, 2)
+    assert best is not None
+    assert best["tok_s"] == 14720.0
+
+
+
 

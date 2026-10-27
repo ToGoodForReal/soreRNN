@@ -543,4 +543,26 @@ Execute os 7 passos numerados na ordem abaixo:
 7. **Consolidação na configuração de pré-treino:**
    Grave os hiperparâmetros e overrides da configuração vencedora em `configs/b0_8_pretrain.yaml` (ajustando `model_overrides`, por exemplo `model_overrides: {grad_checkpoint: true, checkpoint_policy: selective, checkpoint_frac: 0.5}`, e `fp8` se aprovado no A/B) e anote os números medidos (tok/s, MFU, pico de VRAM) na documentação do runbook antes de disparar o treino final de 50B tokens.
 
+### 12.3 Resultados e Decisões do Dia 1 (FP8 vs BF16)
+
+Em 27 de Outubro de 2026, o protocolo foi executado na NVIDIA GeForce RTX 4090 24GB física (sm89, Driver 595.99.02, CUDA 13.2, PyTorch 2.14.1+cu130, TorchAO 0.18.0):
+
+1. **Investigação do FP8 Tensorwise:**
+   - Embora o benchmark inicial tenha reportado falsos ~17.691 tok/s, a corrida de validação A/B (3e8 tokens) revelou **falha crítica**: 100% dos passos resultaram em `gnorm: nan` e foram descartados (`skipped: true`). O otimizador nunca atualizou pesos (a perda permaneceu congelada em ~11.33).
+   - Causa raiz: A escala dinâmica global de ativações no backward sob `torch.compile` e `grad_checkpoint` causa overflow/underflow de escala no `torchao 0.18`. O script `scripts/bench.py` foi atualizado para verificar finitude de gradiente e invalidar tais medições.
+
+2. **Investigação do FP8 Rowwise:**
+   - Estabilidade numérica comprovada (0 skips, loss decresceu normalmente), mas o throughput real foi de **~13.650 tok/s** (MFU 45,3%), tornando-se **~7,3% mais lento que o BF16**.
+   - Causa raiz: Overhead das operações de redução linha a linha no `d_model=1280` superou o ganho computacional dos Tensor Cores FP8.
+
+3. **Decisão Oficial:**
+   - FP8 foi descartado para o pré-treino final de 50B tokens.
+   - **Configuração Oficial Adotada (`configs/b0_8_pretrain.yaml`):**
+     - `fp8: "off"` (BF16 puro).
+     - `model_overrides`: `vocab_size: 98304`, `grad_checkpoint: true`, `checkpoint_policy: "ffn"`, `checkpoint_frac: 1.0`.
+     - Throughput medido no treino A/B: **~14.720 tok/s** (MFU 48,9%), estimando a conclusão do pré-treino de 50B tokens em ~39,3 dias.
+     - Pico de VRAM alocada: 22,37 GB (estável ao longo de 572 passos na RTX 4090, sem nenhum OOM).
+     - Alternativa estrita $\le 22$ GB: `checkpoint_policy: "full"`, `checkpoint_frac: 0.5`, alavancas exatas ativadas (13.550 tok/s com 19,94 GB).
+
+
 

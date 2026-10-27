@@ -1,6 +1,14 @@
 # Pré-treino do preset b0_8 (~0.8B) na RTX 4090: 50B tokens, contexto 4K até 35B e 8K depois.
+# Configuração validada no Protocolo de Dia 1: BF16 puro com checkpoint_policy='ffn' (~14.720 tok/s, 22.37 GB VRAM).
+# Alternativa estrita <= 22 GB: checkpoint_policy='full', checkpoint_frac=0.5, fused_ce=true, fused_norm_gate=true,
+# gdn_fla_conv=true, gdn_kernel_gate=true (~13.550 tok/s, 19.94 GB VRAM).
 model_preset: b0_8
-model_overrides: {grad_checkpoint: true, vocab_size: 98304}
+fp8: "off"
+model_overrides:
+  vocab_size: 98304
+  grad_checkpoint: true
+  checkpoint_policy: "ffn"
+  checkpoint_frac: 1.0
 data_paths: ["data/pretrain/*.bin"]
 eos_id: 98303
 

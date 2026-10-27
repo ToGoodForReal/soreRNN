@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -115,12 +116,12 @@ def train_step(
     optimizers: list[torch.optim.Optimizer],
     make_batches: Callable[[], list[tuple[Tensor, Tensor, Tensor, Tensor | None]]],
     device: torch.device,
-) -> tuple[float, dict[str, float]]:
-    """Um passo do trainer; devolve `(parede_s, fases_s)`.
+) -> tuple[float, dict[str, float], bool, float]:
+    """Um passo do trainer; devolve `(parede_s, fases_s, finite, grad_norm)`.
 
     Monta os micro-batches (`make_batches`: `(ids, labels, cu_seqlens, cu_seqlens_cpu)`, já na GPU e
     com o `cu_seqlens_cpu` na CPU, ou `None`), faz o backward de cada um (loss / n), o clip em 1.0 e o
-    passo dos otimizadores. As fases `PHASES` saem de eventos CUDA gravados entre elas: com a GPU
+    passo dos otimizadores (se finite). As fases `PHASES` saem de eventos CUDA gravados entre elas: com a GPU
     esperando a CPU, o tempo ocioso entra na fase em que ocorreu (as fases somam a parede).
     """
     marks = [torch.cuda.Event(enable_timing=True) for _ in range(len(PHASES) + 1)]
@@ -134,15 +135,18 @@ def train_step(
             out = model(ids, cu_seqlens=cu_seqlens, labels=labels, cu_seqlens_cpu=cu_seqlens_cpu)
         (out.loss / len(batches)).backward()
     marks[2].record()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     marks[3].record()
+    norm_val = float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+    finite = math.isfinite(norm_val)
     for opt in optimizers:
-        opt.step()
+        if finite:
+            opt.step()
         opt.zero_grad(set_to_none=True)
     marks[4].record()
     torch.cuda.synchronize(device)
     wall = time.perf_counter() - t0
-    return wall, {p: marks[i].elapsed_time(marks[i + 1]) / 1e3 for i, p in enumerate(PHASES)}
+    return wall, {p: marks[i].elapsed_time(marks[i + 1]) / 1e3 for i, p in enumerate(PHASES)}, finite, norm_val
 
 
 def main() -> None:
@@ -198,6 +202,12 @@ def main() -> None:
     try:
         model = SoreLM(cfg).to(device)
         if args.fp8 != "off":
+            if args.fp8 == "tensorwise" and args.compile:
+                print(
+                    "[bench AVISO] fp8='tensorwise' com --compile é instável no torchao 0.18/cu130 "
+                    "e produz gradientes NaN no backward. Use 'rowwise' ou 'off'.",
+                    flush=True,
+                )
             apply_fp8(model, args.fp8, emulate=args.fp8_emulate)
         optimizers = build_optimizers(model, lr_muon=3e-3, lr_adamw=3e-3, weight_decay=0.1)  # defaults do TrainConfig
         if args.compile:
@@ -234,14 +244,18 @@ def main() -> None:
 
     times: list[float] = []
     phases: list[dict[str, float]] = []
+    has_non_finite_grad = False
     for step in range(args.steps):
         try:
-            wall, step_phases = train_step(model, optimizers, make_batches, device)
+            wall, step_phases, finite, norm_val = train_step(model, optimizers, make_batches, device)
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
             print(f"[bench] OOM no passo {step + 1}: pico alocado {peak:.2f} GB", flush=True)
             write_oom_record(args.out, args.preset, overrides, args.seq_len, args.micro_batch, args.peak_tflops)
             sys.exit(1)
+        if not finite:
+            has_non_finite_grad = True
+            print(f"  [bench AVISO] passo {step + 1}/{args.steps}: grad_norm não finito ({norm_val})! Passo descartado.", flush=True)
         times.append(wall)
         phases.append(step_phases)
         print(f"  passo {step + 1}/{args.steps}: {wall:.3f} s ({tokens / wall:,.0f} tok/s)", flush=True)
@@ -271,6 +285,7 @@ def main() -> None:
         "mem_gb": torch.cuda.max_memory_allocated(device) / 1e9,
         "mem_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9,
         "phases": {p: statistics.median(s[p] for s in phases[args.warmup :]) for p in PHASES},
+        "finite_grads": not has_non_finite_grad,
     }
     if args.profile:
         # Os mesmos batches duas vezes: um micro-batch com formato inédito (por exemplo, janela de 1
@@ -282,18 +297,25 @@ def main() -> None:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             ) as prof:
-                prof_wall, _ = train_step(model, optimizers, lambda: fixed, device)
+                prof_wall, _, _, _ = train_step(model, optimizers, lambda: fixed, device)
             result["kernels"] = {**kernel_breakdown(prof), "idle": idle_seconds(prof, prof_wall)}
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
             print(f"[bench] OOM durante profiling: pico alocado {peak:.2f} GB", flush=True)
             write_oom_record(args.out, args.preset, overrides, args.seq_len, args.micro_batch, args.peak_tflops)
             sys.exit(1)
+    if has_non_finite_grad:
+        print(
+            "\n[bench AVISO CRÍTICO] Gradientes não finitos (NaN/Inf) foram detectados durante o benchmark!\n"
+            "As medições de throughput e MFU são puramente computacionais e NÃO representam treino convergente.\n",
+            flush=True,
+        )
     print(
         f"[bench] {args.preset} seq {args.seq_len} x mb {args.micro_batch} x accum {args.grad_accum} | "
         f"compile={'on' if args.compile else 'off'} ckpt={'on' if args.grad_checkpoint else 'off'} | "
-        f"{tok_s:,.0f} tok/s (mediana de {args.steps - args.warmup}) | "
-        f"MFU {result['mfu']:.1%} (pico {args.peak_tflops:g} TFLOPs) | "
+        f"{tok_s:,.0f} tok/s (mediana de {args.steps - args.warmup})"
+        + (" [INVÁLIDO: grad_norm NaN]" if has_non_finite_grad else "")
+        + f" | MFU {result['mfu']:.1%} (pico {args.peak_tflops:g} TFLOPs) | "
         f"VRAM pico {result['mem_gb']:.2f} GB (reservado {result['mem_reserved_gb']:.2f} GB)",
         flush=True,
     )

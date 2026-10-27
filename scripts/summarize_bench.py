@@ -86,7 +86,9 @@ def format_table(entries: list[dict]) -> str:
             else:
                 vram_str = "-"
 
-            if tok_s >= 15000.0:
+            if entry.get("finite_grads") is False:
+                flag_str = "**INVÁLIDO (grad norm NaN)**"
+            elif tok_s >= 15000.0:
                 flag_str = ">= 15.000 tok/s (meta 50%)"
             elif tok_s >= 11800.0:
                 flag_str = ">= 11.800 tok/s (piso)"
@@ -123,7 +125,7 @@ def find_best_exact(bench_path: Path | str, seq_len: int, micro_batch: int) -> d
             if not line:
                 continue
             entry = json.loads(line)
-            if entry.get("oom", False):
+            if entry.get("oom", False) or not entry.get("finite_grads", True):
                 continue
             if entry.get("fp8", "off") != "off":
                 continue

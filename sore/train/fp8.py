@@ -69,6 +69,16 @@ def apply_fp8(model: nn.Module, recipe: str, emulate: bool = False) -> int:
     if recipe not in ("tensorwise", "rowwise"):
         raise ValueError(f"receita FP8 inválida: {recipe!r}; use 'tensorwise' ou 'rowwise'")
 
+    if recipe == "tensorwise":
+        import warnings
+        warnings.warn(
+            "A receita FP8 'tensorwise' sofre de instabilidade numérica sob torch.compile "
+            "e grad_checkpoint (produz gradientes NaN no backward no torchao 0.18/cu130 em sm89). "
+            "Recomenda-se usar 'rowwise' ou desativar FP8 ('off').",
+            UserWarning,
+            stacklevel=2,
+        )
+
     param = next(model.parameters(), None)
     device = param.device if param is not None else torch.device("cpu")
 
