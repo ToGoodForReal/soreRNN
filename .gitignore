@@ -29,6 +29,10 @@ backup_old/
 
 # Python / v2
 /runs/
-/data/
+/data/*
+!/data/sample_pt/
+/data/sample_pt/*
+!/data/sample_pt/doc_lengths.json
+!/data/sample_pt/meta.json
 .pytest_cache/
 *.pt

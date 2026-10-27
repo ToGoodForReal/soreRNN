@@ -1,0 +1,13 @@
+{
+  "source_urls": [
+    "https://huggingface.co/datasets/allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00000-of-01024.json.gz",
+    "https://huggingface.co/datasets/allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00001-of-01024.json.gz",
+    "https://huggingface.co/datasets/allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/multilingual/c4-pt.tfrecord-00002-of-01024.json.gz"
+  ],
+  "tokenizer_repo": "Qwen/Qwen3.5-0.8B",
+  "tokenizer_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "eos_old_id": 248044,
+  "n_tokens": 300000000,
+  "n_docs": 387560,
+  "unk_rate": 0.00193377
+}
