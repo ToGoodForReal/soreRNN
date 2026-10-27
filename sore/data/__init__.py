@@ -21,8 +21,10 @@ from sore.data.prune_tokenizer import (
     is_merge_closed,
     select_pruned_vocab,
 )
+from sore.data.sharder import BinarySharder
 
 __all__ = [
+    "BinarySharder",
     "MinHashLSH",
     "build_dependency_graph",
     "build_remapping_tensors",
