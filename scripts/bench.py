@@ -25,6 +25,10 @@ no host (um sync por micro-batch no `prepare_chunk_indices`). Serve para medir o
 
 `--out FILE.jsonl` acrescenta uma linha JSON por execução (a mesma do `--json`).
 
+O grad norm de cada passo é checado depois da medição: se algum sair não finito (NaN/inf), o
+resultado sai com `grad_finite: false` e o `summarize_bench.py` o marca como inválido. `--fp8 tensorwise`
+com `--compile` é recusado (gera gradientes NaN no torch 2.14.1 / torchao 0.18).
+
 Uso: uv run python scripts/bench.py --preset s150m --seq-len 2048 --micro-batch 1 --steps 10 \
          --grad-checkpoint --peak-tflops 35 [--compile] [--grad-accum 1] [--warmup 2] [--json] \
          [--override n_layers=4] [--doc-lengths data/sample_pt/doc_lengths.json] [--profile] [--out F.jsonl]
@@ -46,7 +50,7 @@ from torch import Tensor
 from sore.model import SoreLM, get_preset
 from sore.model.flops import flops_per_token
 from sore.model.loss import IGNORE_INDEX
-from sore.train.config import parse_overrides
+from sore.train.config import TENSORWISE_COMPILE_ERROR, parse_overrides
 from sore.train.fp8 import apply_fp8
 from sore.train.optim import build_optimizers
 from sore.train.profiling import idle_seconds, kernel_breakdown
@@ -115,8 +119,8 @@ def train_step(
     optimizers: list[torch.optim.Optimizer],
     make_batches: Callable[[], list[tuple[Tensor, Tensor, Tensor, Tensor | None]]],
     device: torch.device,
-) -> tuple[float, dict[str, float]]:
-    """Um passo do trainer; devolve `(parede_s, fases_s)`.
+) -> tuple[float, dict[str, float], Tensor]:
+    """Um passo do trainer; devolve `(parede_s, fases_s, grad_norm)` (o norm antes do clip, na GPU).
 
     Monta os micro-batches (`make_batches`: `(ids, labels, cu_seqlens, cu_seqlens_cpu)`, já na GPU e
     com o `cu_seqlens_cpu` na CPU, ou `None`), faz o backward de cada um (loss / n), o clip em 1.0 e o
@@ -134,7 +138,7 @@ def train_step(
             out = model(ids, cu_seqlens=cu_seqlens, labels=labels, cu_seqlens_cpu=cu_seqlens_cpu)
         (out.loss / len(batches)).backward()
     marks[2].record()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     marks[3].record()
     for opt in optimizers:
         opt.step()
@@ -142,7 +146,7 @@ def train_step(
     marks[4].record()
     torch.cuda.synchronize(device)
     wall = time.perf_counter() - t0
-    return wall, {p: marks[i].elapsed_time(marks[i + 1]) / 1e3 for i, p in enumerate(PHASES)}
+    return wall, {p: marks[i].elapsed_time(marks[i + 1]) / 1e3 for i, p in enumerate(PHASES)}, grad_norm
 
 
 def main() -> None:
@@ -182,6 +186,8 @@ def main() -> None:
         parser.error("exige 0 <= --warmup < --steps")
     if not torch.cuda.is_available():
         parser.error("o benchmark exige GPU CUDA")
+    if args.fp8 == "tensorwise" and args.compile:
+        parser.error(TENSORWISE_COMPILE_ERROR)
     try:
         overrides = parse_overrides(args.override)
         cfg = get_preset(args.preset, **{"grad_checkpoint": args.grad_checkpoint, **overrides})
@@ -234,9 +240,10 @@ def main() -> None:
 
     times: list[float] = []
     phases: list[dict[str, float]] = []
+    nonfinite_steps = 0
     for step in range(args.steps):
         try:
-            wall, step_phases = train_step(model, optimizers, make_batches, device)
+            wall, step_phases, grad_norm = train_step(model, optimizers, make_batches, device)
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
             print(f"[bench] OOM no passo {step + 1}: pico alocado {peak:.2f} GB", flush=True)
@@ -244,7 +251,14 @@ def main() -> None:
             sys.exit(1)
         times.append(wall)
         phases.append(step_phases)
-        print(f"  passo {step + 1}/{args.steps}: {wall:.3f} s ({tokens / wall:,.0f} tok/s)", flush=True)
+        # já sincronizado no fim do train_step: ler o norm aqui não entra no tempo do passo
+        finite = bool(torch.isfinite(grad_norm))
+        nonfinite_steps += not finite
+        print(
+            f"  passo {step + 1}/{args.steps}: {wall:.3f} s ({tokens / wall:,.0f} tok/s)"
+            + ("" if finite else f" | grad norm não finito ({grad_norm.item()})"),
+            flush=True,
+        )
 
     step_s = statistics.median(times[args.warmup :])
     tok_s = tokens / step_s
@@ -271,6 +285,7 @@ def main() -> None:
         "mem_gb": torch.cuda.max_memory_allocated(device) / 1e9,
         "mem_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9,
         "phases": {p: statistics.median(s[p] for s in phases[args.warmup :]) for p in PHASES},
+        "grad_finite": nonfinite_steps == 0,
     }
     if args.profile:
         # Os mesmos batches duas vezes: um micro-batch com formato inédito (por exemplo, janela de 1
@@ -282,7 +297,7 @@ def main() -> None:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             ) as prof:
-                prof_wall, _ = train_step(model, optimizers, lambda: fixed, device)
+                prof_wall, _, _ = train_step(model, optimizers, lambda: fixed, device)
             result["kernels"] = {**kernel_breakdown(prof), "idle": idle_seconds(prof, prof_wall)}
         except torch.OutOfMemoryError:
             peak = torch.cuda.max_memory_allocated(device) / 1e9
@@ -297,6 +312,12 @@ def main() -> None:
         f"VRAM pico {result['mem_gb']:.2f} GB (reservado {result['mem_reserved_gb']:.2f} GB)",
         flush=True,
     )
+    if nonfinite_steps:
+        print(
+            f"[bench] AVISO: grad norm não finito em {nonfinite_steps}/{args.steps} passos; "
+            "o tok/s não corresponde a um treino válido",
+            flush=True,
+        )
     print("[bench] fases (s/passo): " + " | ".join(f"{p} {v:.3f}" for p, v in result["phases"].items()), flush=True)
     if args.profile:
         print(

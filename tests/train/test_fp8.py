@@ -54,6 +54,11 @@ def test_train_config_fp8_validation(tmp_path: Path):
     with pytest.raises(ValueError, match="fp8"):
         TrainConfig(**base_kwargs, fp8="invalid_recipe")
 
+    # tensorwise sob torch.compile gera dW NaN (torch 2.14.1 / torchao 0.18): recusado; rowwise passa
+    with pytest.raises(ValueError, match="tensorwise"):
+        TrainConfig(**base_kwargs, fp8="tensorwise", compile=True)
+    assert TrainConfig(**base_kwargs, fp8="rowwise", compile=True).compile
+
 
 def test_fp8_supported():
     """fp8_supported devolve False em CPU e confere capacidade >= (8, 9) em CUDA."""
@@ -203,7 +208,7 @@ def test_train_fp8_resume_cross_toggle(tmp_path: Path, device: str):
         compile=can_compile,
         out_dir=str(out_dir_1),
         device=device,
-        fp8="tensorwise",
+        fp8="rowwise",  # tensorwise + compile é recusado
         fp8_emulate=True,
     )
     # Roda 2 passos com FP8
@@ -259,7 +264,7 @@ def test_train_fp8_resume_cross_toggle(tmp_path: Path, device: str):
         compile=can_compile,
         out_dir=str(out_dir_2),
         device=device,
-        fp8="tensorwise",
+        fp8="rowwise",  # tensorwise + compile é recusado
         fp8_emulate=True,
     )
     summary_2 = train(cfg_fp8_2, resume=out_dir_2 / "last.pt", max_steps=2)

@@ -1,7 +1,7 @@
 """Sumariza os resultados do benchmark gerados por scripts/bench.py (--out FILE.jsonl).
 
 Lê cada linha JSON, lida com entradas normais e entradas de OOM, e gera uma tabela em
-Markdown ordenada por tok/s (decrescente, OOM no fim).
+Markdown ordenada por tok/s (decrescente; entradas com grad norm não finito e OOM no fim).
 Destaca configurações que atingem a meta de 15.000 tok/s (MFU >= 50%) ou o piso de 11.800 tok/s.
 
 Uso:
@@ -47,13 +47,18 @@ def format_config_desc(entry: dict) -> str:
     return " | ".join(parts) if parts else (preset or "base")
 
 
+def is_valid(entry: dict) -> bool:
+    """Falso se o bench viu grad norm não finito (resultados antigos, sem o campo, contam como válidos)."""
+    return entry.get("grad_finite", True)
+
+
 def format_table(entries: list[dict]) -> str:
     """Formata a lista de resultados em uma tabela Markdown ordenada."""
     normal_entries = [e for e in entries if not e.get("oom", False)]
     oom_entries = [e for e in entries if e.get("oom", False)]
 
-    # Ordena decrescente por throughput (tok/s); OOM fica no final
-    normal_entries.sort(key=lambda e: float(e.get("tok_s", 0.0)), reverse=True)
+    # Ordena decrescente por throughput (tok/s); grad não finito (tok/s sem valor) e OOM ficam no final
+    normal_entries.sort(key=lambda e: (is_valid(e), float(e.get("tok_s", 0.0))), reverse=True)
     sorted_entries = normal_entries + oom_entries
 
     lines = [
@@ -86,7 +91,9 @@ def format_table(entries: list[dict]) -> str:
             else:
                 vram_str = "-"
 
-            if tok_s >= 15000.0:
+            if not is_valid(entry):
+                flag_str = "**inválido: grad norm não finito**"
+            elif tok_s >= 15000.0:
                 flag_str = ">= 15.000 tok/s (meta 50%)"
             elif tok_s >= 11800.0:
                 flag_str = ">= 11.800 tok/s (piso)"
@@ -125,7 +132,7 @@ def find_best_exact(bench_path: Path | str, seq_len: int, micro_batch: int) -> d
             entry = json.loads(line)
             if entry.get("oom", False):
                 continue
-            if entry.get("fp8", "off") != "off":
+            if entry.get("fp8", "off") != "off" or not is_valid(entry):
                 continue
             if entry.get("seq_len") == seq_len and entry.get("micro_batch") == micro_batch:
                 candidates.append(entry)

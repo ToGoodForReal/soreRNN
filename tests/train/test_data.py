@@ -44,6 +44,38 @@ def test_write_token_shard_roundtrip_and_sidecar(tmp_path):
     assert json.loads(path.with_suffix(".json").read_text()) == {"n_tokens": 4, "dtype": "uint32"}
 
 
+def test_write_token_shard_uint16(tmp_path):
+    path = tmp_path / "a.bin"
+    tokens = np.array([0, 1, 65535, 7], dtype=np.int64)
+    write_token_shard(path, tokens, "uint16")
+    assert np.fromfile(path, dtype="<u2").tolist() == tokens.tolist()
+    assert path.stat().st_size == 2 * len(tokens)
+    assert json.loads(path.with_suffix(".json").read_text()) == {"n_tokens": 4, "dtype": "uint16"}
+
+
+@pytest.mark.parametrize("dtype, bad", [("uint16", 65536), ("uint16", -1), ("uint32", 1 << 32)])
+def test_write_token_shard_out_of_range(tmp_path, dtype, bad):
+    with pytest.raises(ValueError, match="intervalo"):
+        write_token_shard(tmp_path / "a.bin", np.array([0, bad], dtype=np.int64), dtype)
+    with pytest.raises(ValueError, match="dtype"):
+        write_token_shard(tmp_path / "b.bin", np.array([0]), "int8")
+
+
+def test_uint16_and_uint32_shards_give_same_batches(tmp_path):
+    tokens = np.arange(5000) % 13 + np.arange(5000) // 13 * 1000 % 60000  # ids até ~60k, EOS = 0
+    p32, p16 = tmp_path / "a32.bin", tmp_path / "a16.bin"
+    write_token_shard(p32, tokens, "uint32")
+    write_token_shard(p16, tokens, "uint16")
+    s32 = PackedTokenStream([p32], seq_len=64, micro_batch=2, eos_id=0, seed=1)
+    s16 = PackedTokenStream([p16], seq_len=64, micro_batch=2, eos_id=0, seed=1)
+    for _ in range(20):
+        b32, b16 = next(s32), next(s16)
+        assert b16.input_ids.dtype == torch.int64
+        assert torch.equal(b32.input_ids, b16.input_ids)
+        assert torch.equal(b32.labels, b16.labels)
+        assert torch.equal(b32.cu_seqlens, b16.cu_seqlens)
+
+
 def test_invalid_sidecar_raises(tmp_path):
     path = _periodic_shard(tmp_path, 100)
     sidecar = path.with_suffix(".json")
@@ -52,8 +84,13 @@ def test_invalid_sidecar_raises(tmp_path):
     with pytest.raises(ValueError, match="n_tokens"):
         PackedTokenStream([path], seq_len=8, micro_batch=1, eos_id=0, seed=0)
 
-    sidecar.write_text(json.dumps({"n_tokens": 100, "dtype": "uint16"}))
+    sidecar.write_text(json.dumps({"n_tokens": 100, "dtype": "float32"}))
     with pytest.raises(ValueError, match="dtype"):
+        PackedTokenStream([path], seq_len=8, micro_batch=1, eos_id=0, seed=0)
+
+    # 400 bytes lidos como uint16 são 200 tokens, não 100
+    sidecar.write_text(json.dumps({"n_tokens": 100, "dtype": "uint16"}))
+    with pytest.raises(ValueError, match="n_tokens"):
         PackedTokenStream([path], seq_len=8, micro_batch=1, eos_id=0, seed=0)
 
 

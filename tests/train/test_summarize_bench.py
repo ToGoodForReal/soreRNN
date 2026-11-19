@@ -181,3 +181,24 @@ def test_b0_8_fp8_ab_configs_load():
 
 
 
+
+
+def test_summarize_bench_marks_nonfinite_grad(tmp_path: Path):
+    """Entrada com grad_finite=false vai para o fim (antes do OOM), marcada inválida e fora do best-exact."""
+    from scripts.summarize_bench import find_best_exact
+
+    bench_file = tmp_path / "bench.jsonl"
+    e_nan = {"seq_len": 4096, "micro_batch": 2, "tok_s": 17000.0, "mfu": 0.56, "fp8": "off", "grad_finite": False}
+    e_ok = {"seq_len": 4096, "micro_batch": 2, "tok_s": 13000.0, "mfu": 0.43, "fp8": "off", "grad_finite": True}
+    e_old = {"seq_len": 4096, "micro_batch": 2, "tok_s": 12000.0, "mfu": 0.40, "fp8": "off"}  # sem o campo
+    e_oom = {"seq_len": 4096, "micro_batch": 2, "oom": True}
+    with bench_file.open("w") as f:
+        for entry in [e_nan, e_ok, e_old, e_oom]:
+            f.write(json.dumps(entry) + "\n")
+
+    data_lines = [l for l in summarize_bench(bench_file).splitlines()[2:] if l.strip()]
+    assert "13,000" in data_lines[0]
+    assert "12,000" in data_lines[1]
+    assert "17,000" in data_lines[2] and "inválido" in data_lines[2]
+    assert "OOM" in data_lines[3]
+    assert find_best_exact(bench_file, 4096, 2)["tok_s"] == 13000.0

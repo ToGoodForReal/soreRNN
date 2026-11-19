@@ -96,10 +96,10 @@ def test_generate_sample_truncates_exactly_and_ends_in_eos(tmp_path):
 
     stats = generate_sample(iter(texts), tok, 1, tmp_path, n_tokens=10, seed=0)
 
-    shard = np.fromfile(tmp_path / "sample_000.bin", dtype="<u4")
+    shard = np.fromfile(tmp_path / "sample_000.bin", dtype="<u2")  # vocab <= 65.536: uint16
     assert len(shard) == stats["n_tokens"] == 10 and stats["n_docs"] == 3
     assert shard[-1] == 0 and stats["unk_rate"] == 0.0
-    assert json.loads((tmp_path / "sample_000.json").read_text())["n_tokens"] == 10
+    assert json.loads((tmp_path / "sample_000.json").read_text()) == {"n_tokens": 10, "dtype": "uint16"}
     assert sorted(json.loads((tmp_path / "doc_lengths.json").read_text())["lengths"]) == [2, 4, 4]
     assert not (tmp_path / "tokens_old.tmp").exists()
     assert len(np.load(tmp_path / "remap.npy")) == tok.get_vocab_size()

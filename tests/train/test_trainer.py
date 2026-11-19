@@ -713,9 +713,12 @@ def test_b0_8_config_values():
     cfg = load_train_config(REPO / "configs" / "b0_8_pretrain.yaml")
     assert cfg.stages == [Stage(35_000_000_000, 4096, 2), Stage(50_000_000_000, 8192, 1)]
     assert (cfg.total_tokens, cfg.grad_accum, cfg.compile) == (50_000_000_000, 64, True)
-    assert cfg.model_overrides == {"grad_checkpoint": True}
-    # R27: last.pt a cada 5e7 tokens (~95 passos) e 4 snapshots numerados, um a cada 2,5e9
-    assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens, cfg.keep_snapshots) == (50_000_000, 2_500_000_000, 4)
+    # BF16 com checkpoint full em todos os blocos: ~15,9 GB, deixando ~8 GB para outro treino na GPU
+    assert cfg.fp8 == "off"
+    assert cfg.model_overrides == {"grad_checkpoint": True, "checkpoint_policy": "full", "checkpoint_frac": 1.0}
+    assert cfg.max_vram_gb == 16.5  # GPU dividida: ~8 GB livres para outro treino
+    # só o last.pt, sobrescrito a cada 5e7 tokens (~95 passos); snapshots numerados desligados
+    assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens) == (50_000_000, 0)
 
 
 def test_resolve_data_paths(tmp_path):
@@ -855,3 +858,28 @@ def test_resume_toggles_execution_fields(tmp_path):
     opts4 = build_optimizers(model4, lr_muon=cfg4.lr_muon, lr_adamw=cfg4.lr_adamw, weight_decay=cfg4.weight_decay)
     load_checkpoint(ckpt_path3, model4, opts4)
 
+
+
+def test_max_vram_gb_validation(tmp_path):
+    shard = _shard(tmp_path / "a.bin", 4096)
+    assert _cfg(tmp_path / "r", shard, [Stage(4096, 32, 1)], steps=1).max_vram_gb is None
+    assert _cfg(tmp_path / "r", shard, [Stage(4096, 32, 1)], steps=1, max_vram_gb="16.5").max_vram_gb == 16.5
+    with pytest.raises(ValueError, match="max_vram_gb"):
+        _cfg(tmp_path / "r", shard, [Stage(4096, 32, 1)], steps=1, max_vram_gb=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="exige CUDA")
+def test_max_vram_gb_caps_the_allocator(tmp_path, monkeypatch):
+    shard = _shard(tmp_path / "a.bin", 8192)
+    calls = []
+    real = torch.cuda.set_per_process_memory_fraction
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda f, d=None: calls.append(f) or real(f, d))
+    cfg = _cfg(tmp_path / "run", shard, [Stage(5 * 32, 32, 1)], steps=5, device="cuda", max_vram_gb=2.0)
+    try:
+        train(cfg)
+        total = torch.cuda.get_device_properties(0).total_memory
+        assert calls == [pytest.approx(2e9 / total)]
+        with pytest.raises(torch.OutOfMemoryError):  # o alocador recusa passar do teto
+            torch.empty(int(3e9), dtype=torch.uint8, device="cuda")
+    finally:
+        real(1.0)

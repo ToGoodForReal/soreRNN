@@ -1,7 +1,9 @@
-"""Shards de tokens uint32 e stream empacotado determinístico e retomável.
+"""Shards de tokens (uint32 ou uint16) e stream empacotado determinístico e retomável.
 
-Formato em disco: `uint32` little-endian cru (`<u4`) mais um sidecar JSON
-`{"n_tokens": int, "dtype": "uint32"}` ao lado (`path.with_suffix(".json")`).
+Formato em disco: inteiros little-endian crus, `uint32` (`<u4`) ou `uint16` (`<u2`), mais um sidecar
+JSON `{"n_tokens": int, "dtype": "uint32" | "uint16"}` ao lado (`path.with_suffix(".json")`). O
+`uint16` serve para vocabulários de até 65.536 ids (a amostra PT, o s150m) e ocupa metade do disco
+(o b0_8, com 98.304 ids, precisa de `uint32`: 50B tokens = 200 GB). O stream lê os dois formatos e os mistura sem diferença nos batches.
 
 O stream sorteia unidades fixas de `unit_len` tokens por uma permutação determinística de
 `(seed, epoch, unit_len)`, corta cada unidade em janelas consecutivas de `seq_len + 1` tokens
@@ -29,26 +31,38 @@ class Batch:
     cu_seqlens: torch.Tensor
 
 
-def write_token_shard(path: Path, tokens: np.ndarray) -> None:
-    """Grava `tokens` como uint32 little-endian cru e o sidecar `.json` ao lado."""
+SHARD_DTYPES = {"uint32": np.dtype("<u4"), "uint16": np.dtype("<u2")}
+
+
+def write_token_shard(path: Path, tokens: np.ndarray, dtype: str = "uint32") -> None:
+    """Grava `tokens` como inteiros little-endian crus (`dtype`: "uint32" ou "uint16") e o sidecar `.json`.
+
+    Levanta ValueError se algum id não couber no `dtype` (o cast do numpy daria a volta sem aviso).
+    """
+    if dtype not in SHARD_DTYPES:
+        raise ValueError(f"dtype deve ser um de {sorted(SHARD_DTYPES)}, recebeu {dtype!r}")
     path = Path(path)
-    arr = np.asarray(tokens, dtype="<u4")
+    src = np.asarray(tokens)
+    if src.size and (src.min() < 0 or src.max() > np.iinfo(SHARD_DTYPES[dtype]).max):
+        raise ValueError(f"ids fora do intervalo de {dtype}: [{src.min()}, {src.max()}]")
+    arr = src.astype(SHARD_DTYPES[dtype])
     arr.tofile(path)
-    path.with_suffix(".json").write_text(json.dumps({"n_tokens": int(arr.size), "dtype": "uint32"}))
+    path.with_suffix(".json").write_text(json.dumps({"n_tokens": int(arr.size), "dtype": dtype}))
 
 
 def _open_shard(path: Path) -> np.ndarray:
-    """Abre o shard como memmap `<u4` somente leitura, validando o sidecar."""
+    """Abre o shard como memmap somente leitura no `dtype` do sidecar, validando o tamanho."""
     meta = json.loads(path.with_suffix(".json").read_text())
-    if meta.get("dtype") != "uint32":
-        raise ValueError(f"{path}: dtype do sidecar deve ser 'uint32', recebeu {meta.get('dtype')!r}")
-    size = path.stat().st_size
-    if size % 4 != 0 or meta.get("n_tokens") != size // 4:
+    dtype = SHARD_DTYPES.get(meta.get("dtype"))
+    if dtype is None:
+        raise ValueError(f"{path}: dtype do sidecar deve ser um de {sorted(SHARD_DTYPES)}, recebeu {meta.get('dtype')!r}")
+    size, width = path.stat().st_size, dtype.itemsize
+    if size % width != 0 or meta.get("n_tokens") != size // width:
         raise ValueError(
             f"{path}: n_tokens do sidecar ({meta.get('n_tokens')}) não confere com o arquivo "
-            f"({size} bytes = {size / 4} tokens uint32)"
+            f"({size} bytes = {size / width} tokens {meta['dtype']})"
         )
-    return np.memmap(path, dtype="<u4", mode="r")
+    return np.memmap(path, dtype=dtype, mode="r")
 
 
 class PackedTokenStream:

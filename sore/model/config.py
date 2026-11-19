@@ -116,7 +116,8 @@ PRESETS: dict[str, ModelConfig] = {
         gdn_kernel_gate=True, gdn_fla_conv=True, fused_norm_gate=True, fused_ce=True,
     ),
     "b0_8": ModelConfig(
-        vocab_size=65536, d_model=1280, n_layers=24, ffn_dim=4352,
+        # 98.304 = tokenizer Qwen3.5 podado (scripts/prune_tokenizer.py): mais tokens de código e EN
+        vocab_size=98304, d_model=1280, n_layers=24, ffn_dim=4352,
         gdn_qk_heads=10, gdn_v_heads=20,
         attn_heads=10, attn_kv_heads=2,
         mtp_layers=1, gdn_backend="fla", attn_backend="flex",

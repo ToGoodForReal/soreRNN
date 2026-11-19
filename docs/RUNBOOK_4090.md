@@ -26,8 +26,9 @@ uv run pytest -q             # tudo passa; os testes @cuda/@fla têm de rodar, n
 ```
 
 Antes de lançar, edite `configs/b0_8_pretrain.yaml`:
-- `data_paths` e `eos_id` reais (hoje são placeholders, ver seção 6). Os shards são `uint32` com o
-  sidecar `.json` ao lado. O stream corta cada shard em unidades fixas de `unit_len` = 8192 tokens
+- `data_paths` e `eos_id` reais (hoje são placeholders, ver seção 6). Os shards são `uint16` (vocabulário de até
+  65.536 ids) ou `uint32` (o b0_8, com 98.304 ids: 50B tokens = 200 GB), com o sidecar `.json` ao lado
+  dizendo qual. Os dados saem de `scripts/prune_tokenizer.py` e `scripts/make_pretrain_data.py`. O stream corta cada shard em unidades fixas de `unit_len` = 8192 tokens
   (o maior `seq_len` dos estágios; todo `seq_len` precisa dividir `unit_len`) e sorteia as unidades
   por época. No estágio de 4K cada unidade vira 2 janelas seguidas. A troca para 8K continua a mesma
   época a partir da próxima unidade inteira, sem reamostrar o que já foi visto. Um shard com menos
@@ -439,7 +440,8 @@ fp8: "rowwise"          # "off" (padrão), "tensorwise" ou "rowwise"
 fp8_emulate: false      # true apenas para validação em GPUs < sm89 (ex: RTX 3050)
 ```
 
-- `"tensorwise"`: escala dinâmica por tensor (cuBLAS). Opção mais rápida.
+- `"tensorwise"`: escala dinâmica por tensor (cuBLAS). Seria a mais rápida, mas **com `compile: true` é
+  recusada**: no torch 2.14.1 / torchao 0.18 o Inductor gera dW NaN (ver `docs/relatorio_dia1_rtx4090.md`).
 - `"rowwise"`: escala dinâmica por linha (CUTLASS) com e4m3 e potências de 2. Mais precisa.
 - **Escopo do filtro:** converte apenas matrizes `nn.Linear` grandes sob `blocks.` e `mtp.`
   com `in_features` e `out_features` múltiplos de 16, fora de `res_mixer`/`res_ffn`. Projeções
@@ -510,7 +512,7 @@ Execute os 7 passos numerados na ordem abaixo:
    - Cada alavanca exata isolada (`fused_ce`, `gdn_path`, `ckpt_selective`, `ckpt_ffn`);
    - Todas as alavancas exatas juntas;
    - Todas as exatas $\times$ políticas de checkpoint (`full`, `selective`, `ffn`) $\times$ `checkpoint_frac` {1.0, 0.5, 0.25};
-   - A melhor configuração exata com profiling e $\times$ FP8 (`tensorwise` e `rowwise`).
+   - A melhor configuração exata com profiling e $\times$ FP8 `rowwise` (o `tensorwise` é recusado com `--compile`).
    Todos os resultados e eventuais OOMs são registrados em `runs/day1/bench.jsonl`.
 
 5. **Sumarização e inspeção do throughput:**
@@ -532,11 +534,11 @@ Execute os 7 passos numerados na ordem abaixo:
      uv run python -m sore.train --config configs/b0_8_fp8_ab_fp8.yaml \
          --set model_overrides='{checkpoint_policy: selective, checkpoint_frac: 0.5}'
      ```
-     *(Nota: chaves individuais também podem ser passadas pontualmente, ex: `--set model_overrides.checkpoint_policy=selective --set model_overrides.checkpoint_frac=0.5`; e caso a receita vencedora do FP8 no benchmark tenha sido `tensorwise`, sobrescreva com `--set fp8=tensorwise`)*.
+     *(Nota: chaves individuais também podem ser passadas pontualmente, ex: `--set model_overrides.checkpoint_policy=selective --set model_overrides.checkpoint_frac=0.5`)*.
 
      Em seguida, compare as perdas finais com `compare_runs.py` no modo lossy:
      ```bash
-     uv run python scripts/compare_runs.py --ref runs/fp8_ab/bf16 --ref2 runs/fp8_ab/bf16 runs/fp8_ab/fp8 --lossy fp8
+     uv run python scripts/compare_runs.py --ref runs/fp8_ab/bf16 --ref2 runs/fp8_ab/bf16 runs/fp8_ab/fp8_rowwise --lossy fp8
      ```
      **Critério de aprovação (spec §3):** $\text{loss final (FP8)} \le 1{,}01 \times \text{loss final (BF16)}$ (degradação máxima tolerada de 1%).
 

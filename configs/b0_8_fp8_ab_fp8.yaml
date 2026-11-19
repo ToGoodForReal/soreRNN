@@ -1,6 +1,8 @@
 # A/B de FP8 no b0_8: candidata com FP8 (3e8 tokens, estágio 4096x2).
 # Mesmos dados e seed da referência bf16, diferindo apenas em fp8.
-# A receita (rowwise ou tensorwise) e os overrides exatos são configuráveis via --set.
+# Os overrides exatos são configuráveis via --set. Só rowwise: tensorwise com compile é recusado (grad
+# NaN no torch 2.14.1 / torchao 0.18). Ao mudar a receita ou o compile, mude também o out_dir para um
+# run não sobrescrever o metrics.jsonl do outro.
 model_preset: b0_8
 model_overrides: {grad_checkpoint: true}
 data_paths: ["data/sample_pt/*.bin"]
@@ -18,4 +20,4 @@ ckpt_every_tokens: 5e7
 compile: true
 seed: 0
 fp8: "rowwise"
-out_dir: runs/fp8_ab/fp8
+out_dir: runs/fp8_ab/fp8_rowwise
