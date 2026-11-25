@@ -53,7 +53,7 @@ def test_roundtrip_through_json_keeps_layer_pattern_tuple():
         ("s150m", dict(vocab_size=65536, d_model=768, n_layers=12, ffn_dim=2048,
                        gdn_qk_heads=6, gdn_v_heads=12, attn_heads=6, attn_kv_heads=2,
                        gdn_backend="fla", attn_backend="flex")),
-        ("b0_8", dict(vocab_size=65536, d_model=1280, n_layers=24, ffn_dim=4352,
+        ("b0_8", dict(vocab_size=98304, d_model=1280, n_layers=24, ffn_dim=4352,
                       gdn_qk_heads=10, gdn_v_heads=20, attn_heads=10, attn_kv_heads=2,
                       gdn_backend="fla", attn_backend="flex")),
     ],

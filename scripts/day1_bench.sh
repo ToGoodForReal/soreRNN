@@ -12,7 +12,8 @@
 #   2. cada alavanca exata sozinha (fused_ce, gdn_path, ckpt_selective, ckpt_ffn);
 #   3. todas as exatas juntas;
 #   4. todas as exatas x cada política de checkpoint x checkpoint_frac {1.0, 0.5, 0.25};
-#   5. a melhor configuração x --profile e x fp8 {tensorwise, rowwise} (com $FP8_FLAGS).
+#   5. a melhor configuração x --profile e x fp8 rowwise (com $FP8_FLAGS; tensorwise + compile é recusado:
+#      gera grad NaN no torch 2.14.1 / torchao 0.18).
 #
 # No fim, imprime a tabela sumarizada via scripts/summarize_bench.py.
 set -uo pipefail
@@ -164,7 +165,7 @@ for SEQ in $SEQS; do
         done
     done
 
-    # 5. A melhor configuração exata x --profile e x fp8 {tensorwise, rowwise}
+    # 5. A melhor configuração exata x --profile e x fp8 rowwise
     echo ""
     echo "--- 5. Melhor configuração exata para seq_len=$SEQ_LEN, micro_batch=$MB ---"
     BEST_CMD=$(uv run python scripts/summarize_bench.py "$BENCH_JSONL" --best-exact "$SEQ_LEN" "$MB")
@@ -179,9 +180,6 @@ for SEQ in $SEQS; do
 
         echo ">> Rodando profiling da melhor configuração exata..."
         run_bench "--profile" "$SEQ_LEN" "$MB" "${BEST_ARR[@]}"
-
-        echo ">> Rodando melhor configuração com FP8 tensorwise..."
-        run_bench "" "$SEQ_LEN" "$MB" --fp8 tensorwise "${fp8_extra[@]}" "${BEST_ARR[@]}"
 
         echo ">> Rodando melhor configuração com FP8 rowwise..."
         run_bench "" "$SEQ_LEN" "$MB" --fp8 rowwise "${fp8_extra[@]}" "${BEST_ARR[@]}"

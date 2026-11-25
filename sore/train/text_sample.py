@@ -189,7 +189,8 @@ def generate_sample(
         n_unk += int((mapped == UNK_ID).sum())
         new[lo : lo + len(mapped)] = mapped
     del old
-    write_token_shard(out_dir / "sample_000.bin", new)
+    # ids novos < vocab_size: com até 65.536 ids o shard cabe em uint16 (metade do disco)
+    write_token_shard(out_dir / "sample_000.bin", new, "uint16" if vocab_size <= 1 << 16 else "uint32")
     np.save(out_dir / "remap.npy", remap)
     (out_dir / "doc_lengths.json").write_text(json.dumps({"lengths": reservoir.items}))
     tmp.unlink()

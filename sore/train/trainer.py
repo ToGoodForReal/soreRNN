@@ -254,6 +254,11 @@ def train(cfg: TrainConfig, resume: Path | None = None, max_steps: int | None = 
     treino na fronteira do passo, com `last.pt` salvo, e `train` retorna normalmente.
     """
     device = resolve_device(cfg.device)
+    if cfg.max_vram_gb is not None and device.type == "cuda":
+        index = device.index if device.index is not None else torch.cuda.current_device()  # "cuda" -> índice
+        total = torch.cuda.get_device_properties(index).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, cfg.max_vram_gb * 1e9 / total), index)
+        print(f"[train] teto de VRAM: {cfg.max_vram_gb:g} GB de {total / 1e9:.1f} GB", flush=True)
     out_dir = Path(cfg.out_dir)
     if resume is None and (out_dir / "last.pt").exists():
         raise FileExistsError(

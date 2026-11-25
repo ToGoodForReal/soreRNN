@@ -180,40 +180,25 @@ def test_b0_8_fp8_ab_configs_load():
         assert cfg.stages[0].micro_batch == 2
 
 
-def test_summarize_bench_flags_non_finite_grads(tmp_path: Path):
-    """Testa que corridas com finite_grads=False são marcadas como inválidas e ignoradas no best-exact."""
-    from scripts.summarize_bench import find_best_exact, summarize_bench
+
+
+
+def test_summarize_bench_marks_nonfinite_grad(tmp_path: Path):
+    """Entrada com grad_finite=false vai para o fim (antes do OOM), marcada inválida e fora do best-exact."""
+    from scripts.summarize_bench import find_best_exact
 
     bench_file = tmp_path / "bench.jsonl"
-    e_nan = {
-        "preset": "b0_8",
-        "seq_len": 4096,
-        "micro_batch": 2,
-        "tok_s": 17600.0,
-        "mfu": 0.58,
-        "fp8": "tensorwise",
-        "finite_grads": False,
-    }
-    e_valid = {
-        "preset": "b0_8",
-        "seq_len": 4096,
-        "micro_batch": 2,
-        "tok_s": 14720.0,
-        "mfu": 0.489,
-        "fp8": "off",
-        "finite_grads": True,
-    }
+    e_nan = {"seq_len": 4096, "micro_batch": 2, "tok_s": 17000.0, "mfu": 0.56, "fp8": "off", "grad_finite": False}
+    e_ok = {"seq_len": 4096, "micro_batch": 2, "tok_s": 13000.0, "mfu": 0.43, "fp8": "off", "grad_finite": True}
+    e_old = {"seq_len": 4096, "micro_batch": 2, "tok_s": 12000.0, "mfu": 0.40, "fp8": "off"}  # sem o campo
+    e_oom = {"seq_len": 4096, "micro_batch": 2, "oom": True}
     with bench_file.open("w") as f:
-        f.write(json.dumps(e_nan) + "\n")
-        f.write(json.dumps(e_valid) + "\n")
+        for entry in [e_nan, e_ok, e_old, e_oom]:
+            f.write(json.dumps(entry) + "\n")
 
-    table = summarize_bench(bench_file)
-    assert "**INVÁLIDO (grad norm NaN)**" in table
-
-    best = find_best_exact(bench_file, 4096, 2)
-    assert best is not None
-    assert best["tok_s"] == 14720.0
-
-
-
-
+    data_lines = [l for l in summarize_bench(bench_file).splitlines()[2:] if l.strip()]
+    assert "13,000" in data_lines[0]
+    assert "12,000" in data_lines[1]
+    assert "17,000" in data_lines[2] and "inválido" in data_lines[2]
+    assert "OOM" in data_lines[3]
+    assert find_best_exact(bench_file, 4096, 2)["tok_s"] == 13000.0

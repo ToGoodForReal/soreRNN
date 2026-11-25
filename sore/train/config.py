@@ -12,6 +12,14 @@ from typing import Any
 
 import yaml
 
+# torch 2.14.1 / torchao 0.18: sob torch.compile, o dW de um Float8Linear tensorwise cuja entrada vem do
+# mesmo grafo sai NaN (1/16 das entradas; split reduction do amax no Inductor). Os contornos do Inductor
+# (`split_reductions=False`, `cooperative_reductions`) corrigem, mas derrubam o b0_8 para 1-8k tok/s.
+TENSORWISE_COMPILE_ERROR = (
+    "fp8='tensorwise' com compile=True gera gradientes NaN (torch 2.14.1 / torchao 0.18); "
+    "use fp8='rowwise' ou desligue o compile"
+)
+
 
 def _as_int(name: str, x: Any) -> int:
     """Inteiro a partir de int, float integral ou string (`"35e9"`); ValueError se fracionário."""
@@ -108,6 +116,9 @@ class TrainConfig:
     seed: int = 0
     device: str = "auto"  # "auto" -> "cuda" se disponível, senão "cpu"
     peak_tflops: float = 165.0  # pico BF16 denso da GPU (4090) para o MFU do metrics.jsonl
+    # Teto de VRAM do alocador do PyTorch (GB, sem o contexto CUDA de ~0,5 GB); None = sem teto. Com a
+    # GPU dividida com outro treino, passar do teto dá OOM aqui em vez de tomar a memória do outro.
+    max_vram_gb: float | None = None
 
     def __post_init__(self) -> None:
         for name in _INT_FIELDS:
@@ -116,16 +127,22 @@ class TrainConfig:
             setattr(self, name, _as_float(name, getattr(self, name)))
         if self.mtp_weight_start is not None:
             self.mtp_weight_start = _as_float("mtp_weight_start", self.mtp_weight_start)
+        if self.max_vram_gb is not None:
+            self.max_vram_gb = _as_float("max_vram_gb", self.max_vram_gb)
         self.stages = [s if isinstance(s, Stage) else Stage(**s) for s in self.stages]
         self._validate()
 
     def _validate(self) -> None:
         if self.fp8 not in ("off", "tensorwise", "rowwise"):
             raise ValueError(f"fp8 deve ser um de ('off', 'tensorwise', 'rowwise'), recebeu {self.fp8!r}")
+        if self.fp8 == "tensorwise" and self.compile:
+            raise ValueError(TENSORWISE_COMPILE_ERROR)
         if not self.stages:
             raise ValueError("é preciso ao menos um estágio em `stages`")
         if self.grad_accum < 1 or self.log_every < 1 or self.ckpt_every_tokens < 1:
             raise ValueError("grad_accum, log_every e ckpt_every_tokens devem ser >= 1")
+        if self.max_vram_gb is not None and self.max_vram_gb <= 0:
+            raise ValueError(f"max_vram_gb deve ser > 0 (ou None), recebeu {self.max_vram_gb}")
         if self.peak_tflops <= 0:
             raise ValueError(f"peak_tflops deve ser > 0, recebeu {self.peak_tflops}")
         if self.snapshot_every_tokens < 0:
