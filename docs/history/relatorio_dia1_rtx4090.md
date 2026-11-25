@@ -138,7 +138,7 @@ Com `fp8=rowwise` (padrão de [configs/b0_8_fp8_ab_fp8.yaml](../configs/b0_8_fp8
 | **VRAM Alocada** | **22,37 GB** pico em 572 passos (reservado 22,97 GB) | **20,27 GB** no passo 18 (run incompleto) | FP8 (~-2,1 GB) |
 
 > [!IMPORTANT]
-> O pico de **22,37 GB** do BF16 **viola** o critério "VRAM pico (alocado) ≤ 22 GB" de `docs/RUNBOOK_4090.md`. O run completou 572 passos sem OOM, mas apenas no estágio 4096x2; o estágio 8192x1 do pré-treino não foi validado em treino real (no benchmark, ambos os estágios ficam em 22,36 GB).
+> O pico de **22,37 GB** do BF16 **viola** o critério "VRAM pico (alocado) ≤ 22 GB" do runbook da 4090 ([`RUNBOOK_4090.md`](RUNBOOK_4090.md)). O run completou 572 passos sem OOM, mas apenas no estágio 4096x2; o estágio 8192x1 do pré-treino não foi validado em treino real (no benchmark, ambos os estágios ficam em 22,36 GB).
 
 ---
 

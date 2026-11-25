@@ -1,17 +1,21 @@
-# Ablação de arquitetura no preset s150m: 3B tokens.
+# Ablação no s150m antes do pré-treino do b0_4 (docs/RUNBOOK.md §4.4): varredura de lr nos dados reais, com o
+# mesmo tokenizer e o mesmo batch (262.144 tokens por passo) do b0_4. Rode uma vez por lr, mudando
+# out_dir, por exemplo:
+#   uv run python -m sore.train --config configs/s150m_ablation.yaml \
+#       --set lr_muon=1e-3 --set lr_adamw=1e-3 --set out_dir=runs/ablation/lr1e-3
+# ~1,5-2 dias por corrida na RTX 3050 8GB.
 model_preset: s150m
-model_overrides: {grad_checkpoint: true}
-data_paths: ["data/pretrain/*.bin"]
-eos_id: 0  # definir após o plano do tokenizer
+model_overrides: {vocab_size: 98304, grad_checkpoint: true}
+data_paths: ["data/pretrain/*/*.bin"]
+eos_id: 98278  # o mesmo do configs/b0_4_pretrain.yaml (data/tokenizer/meta.json)
 
-# 2048 x 4 x 16 = 4096 x 2 x 16 = 131.072 tokens por passo -> 22.888 passos
-grad_accum: 16
+# 2048 x 2 x 64 = 262.144 tokens por passo -> 1.907 passos
+grad_accum: 64
 stages:
-  - {until_tokens: 2.1e9, seq_len: 2048, micro_batch: 4}
-  - {until_tokens: 3e9, seq_len: 4096, micro_batch: 2}
-total_tokens: 3e9
+  - {until_tokens: 5e8, seq_len: 2048, micro_batch: 2}
+total_tokens: 5e8
 
-warmup_steps: 500
-ckpt_every_tokens: 1e8
+warmup_steps: 200
+ckpt_every_tokens: 2e7
 compile: true
-out_dir: runs/s150m_ablation
+out_dir: runs/ablation/lr3e-3

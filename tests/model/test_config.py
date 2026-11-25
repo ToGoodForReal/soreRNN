@@ -12,6 +12,14 @@ def test_b0_8_layer_types():
     assert types[3] == types[23] == "attn"
 
 
+def test_b0_4_layer_types():
+    types = get_preset("b0_4").layer_types()
+    assert len(types) == 16
+    assert types.count("gdn") == 12
+    assert types.count("attn") == 4
+    assert types[3] == types[15] == "attn"
+
+
 def test_invalid_layers_raises():
     # 6 camadas não é múltiplo do padrão de 4
     with pytest.raises(ValueError):
@@ -53,6 +61,9 @@ def test_roundtrip_through_json_keeps_layer_pattern_tuple():
         ("s150m", dict(vocab_size=65536, d_model=768, n_layers=12, ffn_dim=2048,
                        gdn_qk_heads=6, gdn_v_heads=12, attn_heads=6, attn_kv_heads=2,
                        gdn_backend="fla", attn_backend="flex")),
+        ("b0_4", dict(vocab_size=98304, d_model=1024, n_layers=16, ffn_dim=3584,
+                      gdn_qk_heads=8, gdn_v_heads=16, attn_heads=8, attn_kv_heads=2,
+                      gdn_backend="fla", attn_backend="flex")),
         ("b0_8", dict(vocab_size=98304, d_model=1280, n_layers=24, ffn_dim=4352,
                       gdn_qk_heads=10, gdn_v_heads=20, attn_heads=10, attn_kv_heads=2,
                       gdn_backend="fla", attn_backend="flex")),
@@ -89,7 +100,7 @@ def test_fla_only_options_reject_torch_backend(flag):
     assert getattr(get_preset("tiny"), flag) is False  # tiny (torch) e os defaults ficam desligados
 
 
-@pytest.mark.parametrize("name", ["s150m", "b0_8"])
+@pytest.mark.parametrize("name", ["s150m", "b0_4", "b0_8"])
 def test_fla_presets_enable_gdn_path_options(name):
     c = get_preset(name)
     assert c.gdn_kernel_gate and c.gdn_fla_conv and c.fused_norm_gate and c.fused_ce

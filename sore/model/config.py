@@ -1,4 +1,4 @@
-"""Configuração do modelo (`ModelConfig`) e presets (`tiny`, `s150m`, `b0_8`)."""
+"""Configuração do modelo (`ModelConfig`) e presets (`tiny`, `s150m`, `b0_4`, `b0_8`)."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
@@ -112,6 +112,15 @@ PRESETS: dict[str, ModelConfig] = {
         vocab_size=65536, d_model=768, n_layers=12, ffn_dim=2048,
         gdn_qk_heads=6, gdn_v_heads=12,
         attn_heads=6, attn_kv_heads=2,
+        mtp_layers=1, gdn_backend="fla", attn_backend="flex",
+        gdn_kernel_gate=True, gdn_fla_conv=True, fused_norm_gate=True, fused_ce=True,
+    ),
+    # ~0,41B (309M sem embedding): o alvo do pré-treino de ~10B tokens na RTX 3050 8GB. Mesmas
+    # proporções do b0_8 (head_dim 128, Hv = 2·Hqk, GQA 4:1, FFN ~3,5·D), 16 camadas (12 GDN + 4 atenção).
+    "b0_4": ModelConfig(
+        vocab_size=98304, d_model=1024, n_layers=16, ffn_dim=3584,
+        gdn_qk_heads=8, gdn_v_heads=16,
+        attn_heads=8, attn_kv_heads=2,
         mtp_layers=1, gdn_backend="fla", attn_backend="flex",
         gdn_kernel_gate=True, gdn_fla_conv=True, fused_norm_gate=True, fused_ce=True,
     ),

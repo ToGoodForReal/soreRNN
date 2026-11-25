@@ -19,7 +19,7 @@ QUALITY_DIR=${QUALITY_DIR:-runs/quality}
 # ----------------------------------------------------------------------------------------------
 # PONTO DE EXTENSÃO 1 (cada task de alavanca mexe aqui): ALL_OFF = overrides que DESLIGAM todas as
 # alavancas da lista, um `KEY=VALUE` por elemento. Vale para toda corrida (refs e candidatas), então
-# a candidata difere da referência só pela alavanca que a sua linha liga. Os presets s150m/b0_8
+# a candidata difere da referência só pela alavanca que a sua linha liga. Os presets s150m/b0_4/b0_8
 # já trazem as alavancas do GDN ligadas; é o ALL_OFF que faz as referências rodarem o caminho antigo.
 # Ex. de uma task de alavanca: ALL_OFF+=("model_overrides.fused_ce=false")
 ALL_OFF=(

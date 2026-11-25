@@ -82,6 +82,27 @@ MIXTURE: dict[str, float] = {
     "opc_annealing": 0.03,
 }
 
+CODE_SOURCES = ("github_code", "opc_annealing")
+
+
+def calibration_mixture(code_frac: float, mixture: dict[str, float] = MIXTURE) -> dict[str, float]:
+    """A `mixture` com as fontes de código somando `code_frac` e as demais reescaladas para `1 - code_frac`.
+
+    Serve para a amostra da poda do tokenizer: com mais código na amostra, a poda guarda mais tokens
+    de código (identificadores, indentação, operadores) do que a fração de código do treino guardaria,
+    ao custo de um pouco de fertilidade em PT (o portão de `scripts/prune_tokenizer.py` mede os dois).
+    As proporções dentro de cada grupo (código e não código) ficam as da `mixture`.
+    """
+    if not 0.0 <= code_frac < 1.0:
+        raise ValueError(f"code_frac deve estar em [0, 1), recebeu {code_frac}")
+    code = {n: w for n, w in mixture.items() if n in CODE_SOURCES}
+    rest = {n: w for n, w in mixture.items() if n not in CODE_SOURCES}
+    if code_frac > 0 and not code:
+        raise ValueError("code_frac > 0 mas a mistura não tem fontes de código")
+    out = {n: w / sum(rest.values()) * (1.0 - code_frac) for n, w in rest.items()}
+    out.update({n: w / sum(code.values()) * code_frac for n, w in code.items()} if code_frac > 0 else {})
+    return out
+
 
 def list_files(source: Source, revision: str, api=None) -> list[str]:
     """Caminhos (no repo) dos arquivos da fonte na `revision`, ordenados."""

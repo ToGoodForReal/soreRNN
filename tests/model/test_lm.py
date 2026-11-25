@@ -419,9 +419,11 @@ def test_forward_variants():
 def test_param_counts():
     with torch.device("meta"):
         s150m = SoreLM(get_preset("s150m"))
+        b0_4 = SoreLM(get_preset("b0_4"))
         b0_8 = SoreLM(get_preset("b0_8"))
         b0_8_untied = SoreLM(get_preset("b0_8", tie_embeddings=False))
     assert 0.13e9 <= s150m.num_params() <= 0.17e9, s150m.num_params()
+    assert 0.38e9 <= b0_4.num_params() <= 0.44e9, b0_4.num_params()
     assert 0.75e9 <= b0_8.num_params() <= 0.85e9, b0_8.num_params()
 
     # embedding amarrado conta uma vez; exclude_embedding tira V*D (e a cabeça, se separada)

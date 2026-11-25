@@ -1,4 +1,9 @@
-# Runbook: pré-treino do `b0_8` na RTX 4090
+# Runbook (histórico): pré-treino do `b0_8` na RTX 4090
+
+> **Histórico.** A RTX 4090 queimou em novembro de 2026 e o plano do `b0_8` (50B tokens) foi suspenso. O
+> runbook em uso é o [`docs/RUNBOOK.md`](../RUNBOOK.md) (RTX 3050 8GB, preset `b0_4`). Os configs do `b0_8`
+> citados aqui (`configs/b0_8_*.yaml`) e o `scripts/day1_bench.sh` (hoje `scripts/bench_matrix.sh`) saíram
+> do repositório e continuam no histórico do git (`git log --all -- configs/b0_8_pretrain.yaml`).
 
 Operação do pré-treino de ~6–7 semanas do preset `b0_8` numa RTX 4090 24GB (Linux nativo), com
 `configs/b0_8_pretrain.yaml`.
@@ -441,7 +446,7 @@ fp8_emulate: false      # true apenas para validação em GPUs < sm89 (ex: RTX 3
 ```
 
 - `"tensorwise"`: escala dinâmica por tensor (cuBLAS). Seria a mais rápida, mas **com `compile: true` é
-  recusada**: no torch 2.14.1 / torchao 0.18 o Inductor gera dW NaN (ver `docs/relatorio_dia1_rtx4090.md`).
+  recusada**: no torch 2.14.1 / torchao 0.18 o Inductor gera dW NaN (ver [`relatorio_dia1_rtx4090.md`](relatorio_dia1_rtx4090.md)).
 - `"rowwise"`: escala dinâmica por linha (CUTLASS) com e4m3 e potências de 2. Mais precisa.
 - **Escopo do filtro:** converte apenas matrizes `nn.Linear` grandes sob `blocks.` e `mtp.`
   com `in_features` e `out_features` múltiplos de 16, fora de `res_mixer`/`res_ffn`. Projeções
@@ -545,26 +550,18 @@ Execute os 7 passos numerados na ordem abaixo:
 7. **Consolidação na configuração de pré-treino:**
    Grave os hiperparâmetros e overrides da configuração vencedora em `configs/b0_8_pretrain.yaml` (ajustando `model_overrides`, por exemplo `model_overrides: {grad_checkpoint: true, checkpoint_policy: selective, checkpoint_frac: 0.5}`, e `fp8` se aprovado no A/B) e anote os números medidos (tok/s, MFU, pico de VRAM) na documentação do runbook antes de disparar o treino final de 50B tokens.
 
-### 12.3 Resultados e Decisões do Dia 1 (FP8 vs BF16)
+### 12.3 Resultados do Dia 1
 
-Em 27 de Outubro de 2026, o protocolo foi executado na NVIDIA GeForce RTX 4090 24GB física (sm89, Driver 595.99.02, CUDA 13.2, PyTorch 2.14.1+cu130, TorchAO 0.18.0):
+Os resultados medidos e a análise completa estão em [`relatorio_dia1_rtx4090.md`](relatorio_dia1_rtx4090.md).
+Resumo:
 
-1. **Investigação do FP8 Tensorwise:**
-   - Embora o benchmark inicial tenha reportado falsos ~17.691 tok/s, a corrida de validação A/B (3e8 tokens) revelou **falha crítica**: 100% dos passos resultaram em `gnorm: nan` e foram descartados (`skipped: true`). O otimizador nunca atualizou pesos (a perda permaneceu congelada em ~11.33).
-   - Causa raiz: A escala dinâmica global de ativações no backward sob `torch.compile` e `grad_checkpoint` causa overflow/underflow de escala no `torchao 0.18`. O script `scripts/bench.py` foi atualizado para verificar finitude de gradiente e invalidar tais medições.
-
-2. **Investigação do FP8 Rowwise:**
-   - Estabilidade numérica comprovada (0 skips, loss decresceu normalmente), mas o throughput real foi de **~13.650 tok/s** (MFU 45,3%), tornando-se **~7,3% mais lento que o BF16**.
-   - Causa raiz: Overhead das operações de redução linha a linha no `d_model=1280` superou o ganho computacional dos Tensor Cores FP8.
-
-3. **Decisão Oficial:**
-   - FP8 foi descartado para o pré-treino final de 50B tokens.
-   - **Configuração Oficial Adotada (`configs/b0_8_pretrain.yaml`):**
-     - `fp8: "off"` (BF16 puro).
-     - `model_overrides`: `vocab_size: 98304`, `grad_checkpoint: true`, `checkpoint_policy: "ffn"`, `checkpoint_frac: 1.0`.
-     - Throughput medido no treino A/B: **~14.720 tok/s** (MFU 48,9%), estimando a conclusão do pré-treino de 50B tokens em ~39,3 dias.
-     - Pico de VRAM alocada: 22,37 GB (estável ao longo de 572 passos na RTX 4090, sem nenhum OOM).
-     - Alternativa estrita $\le 22$ GB: `checkpoint_policy: "full"`, `checkpoint_frac: 0.5`, alavancas exatas ativadas (13.550 tok/s com 19,94 GB).
-
-
-
+- **FP8 tensorwise:** o throughput de ~17.691 tok/s do benchmark era inválido. Sob `torch.compile`, o
+  Inductor (torch 2.14.1 / torchao 0.18) gera dW NaN (split reduction do amax), então todos os passos do
+  A/B foram pulados. Em eager o tensorwise é correto. A combinação com `compile: true` agora é recusada pelo
+  `TrainConfig`.
+- **FP8 rowwise:** sem NaN, mas mais lento que o BF16 em todas as formas de GEMM do `b0_8` (~13.650 contra
+  ~14.720 tok/s). O A/B rodou só 18 de 572 passos, então o critério de qualidade nunca foi avaliado.
+- **BF16 `ffn`, frac 1.0:** ~14.720 tok/s em 572 passos a 4096x2, mas com 22,37 GB alocados, acima do
+  critério de 22 GB. O estágio 8192x1 não foi validado em treino real.
+- **Config final na 4090:** BF16 com `checkpoint_policy: full` e frac 1.0 (~11.000 tok/s, ~14 GB), porque a
+  GPU passou a ser dividida com outro treino (`max_vram_gb: 16.5`).

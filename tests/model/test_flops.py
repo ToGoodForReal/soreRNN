@@ -23,7 +23,7 @@ def test_flops_at_least_6n():
     assert flops_per_token(cfg, 4096) >= 6 * _meta_model(cfg).num_params(exclude_embedding=True)
 
 
-@pytest.mark.parametrize("preset", ["tiny", "s150m", "b0_8"])
+@pytest.mark.parametrize("preset", ["tiny", "s150m", "b0_4", "b0_8"])
 def test_flops_monotonic_in_seq_len(preset):
     cfg = get_preset(preset)
     values = [flops_per_token(cfg, t) for t in (256, 1024, 2048, 4096, 8192)]
@@ -37,9 +37,10 @@ def test_flops_monotonic_in_seq_len(preset):
         ("tiny", {"mtp_layers": 0}),
         ("tiny", {"residual": "hyper"}),
         ("s150m", {}),
+        ("b0_4", {}),
         ("b0_8", {}),
     ],
-    ids=["tiny", "tiny_no_mtp", "tiny_hyper", "s150m", "b0_8"],
+    ids=["tiny", "tiny_no_mtp", "tiny_hyper", "s150m", "b0_4", "b0_8"],
 )
 def test_matmul_params_matches_model(preset, overrides):
     # a conta analítica tem de bater com os pesos 2-D dos nn.Linear de blocks + mtp

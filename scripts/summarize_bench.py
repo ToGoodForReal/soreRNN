@@ -5,7 +5,7 @@ Markdown ordenada por tok/s (decrescente; entradas com grad norm não finito e O
 Destaca configurações que atingem a meta de 15.000 tok/s (MFU >= 50%) ou o piso de 11.800 tok/s.
 
 Uso:
-    python scripts/summarize_bench.py runs/day1/bench.jsonl
+    python scripts/summarize_bench.py runs/bench_matrix/bench.jsonl
 """
 from __future__ import annotations
 

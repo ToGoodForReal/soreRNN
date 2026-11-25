@@ -1,5 +1,5 @@
 # Portão de qualidade das alavancas de velocidade: s150m, 2e7 tokens de texto PT real
-# (`data/sample_pt`, ver RUNBOOK_4090.md §8). Rodado por scripts/run_quality_gates.sh, que sobrescreve
+# (`data/sample_pt`, ver docs/RUNBOOK.md §9). Rodado por scripts/run_quality_gates.sh, que sobrescreve
 # `out_dir` e `seed` com --set. Cabe numa 3050 de 8 GB (micro_batch 2 a 2048).
 model_preset: s150m
 data_paths: ["data/sample_pt/*.bin"]

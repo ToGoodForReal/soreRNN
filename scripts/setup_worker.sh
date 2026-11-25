@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Prepara uma máquina "worker" (Linux nativo ou WSL) para rodar a campanha de qualidade.
+# Prepara a máquina de treino (Linux nativo ou WSL; hoje o desktop com a RTX 3050 8GB, docs/RUNBOOK.md §1).
 #
 # Uso: bash scripts/setup_worker.sh [--check]
 #   (sem flag)  confere a GPU, instala o uv se faltar, `uv sync` e os testes @cuda/@fla
 #   --check     só valida (GPU, uv, ambiente sincronizado, torch com CUDA, fla); não instala nada
 #
-# Pressupõe o repositório já presente (git bundle ou push da branch; ver docs/RUNBOOK_4090.md,
-# "Segunda máquina") e a amostra PT em data/sample_pt/. Termina com 0 se tudo está pronto.
+# Pressupõe o repositório já presente (git bundle ou push da branch; ver docs/RUNBOOK.md §1). A amostra PT
+# (data/sample_pt/) só gera um aviso se faltar: ela é feita depois, com o ambiente pronto (docs/RUNBOOK.md §2).
+# Termina com 0 se tudo está pronto.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,7 +41,9 @@ fi
 echo "[setup] $(uv --version)"
 
 # 3. dados e dependências
-[[ -f data/sample_pt/sample_000.bin ]] || fail "data/sample_pt/sample_000.bin ausente (copie ou gere a amostra, RUNBOOK §8)"
+if [[ ! -f data/sample_pt/sample_000.bin ]]; then
+  echo "[setup] aviso: data/sample_pt/sample_000.bin ausente; gere com scripts/make_text_sample.py (docs/RUNBOOK.md §2)" >&2
+fi
 if [[ $CHECK -eq 1 ]]; then
   uv sync --frozen --check >/dev/null 2>&1 || fail "ambiente desatualizado em relação ao uv.lock (rode sem --check)"
 else
@@ -62,7 +65,7 @@ print(f"[setup] torch {torch.__version__} vê {torch.cuda.get_device_name()}; fl
 ' || fail "torch sem CUDA ou fla ausente (mensagem acima)"
 
 if [[ $CHECK -eq 1 ]]; then
-  echo "[setup] --check: GPU, uv, amostra, ambiente, CUDA no torch e fla OK"
+  echo "[setup] --check: GPU, uv, ambiente, CUDA no torch e fla OK"
   exit 0
 fi
 

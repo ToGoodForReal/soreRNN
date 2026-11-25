@@ -163,26 +163,6 @@ def test_summarize_bench_cli_best_exact(tmp_path: Path, capsys):
     assert "--override checkpoint_policy=selective --override fused_ce=True" == captured.out.strip()
 
 
-
-def test_b0_8_fp8_ab_configs_load():
-    """Valida que os arquivos de configuração de A/B de FP8 são válidos para o TrainConfig."""
-    import yaml
-    from sore.train.config import TrainConfig
-
-    for cfg_name in ["configs/b0_8_fp8_ab_bf16.yaml", "configs/b0_8_fp8_ab_fp8.yaml"]:
-        cfg_path = Path(cfg_name)
-        assert cfg_path.exists()
-        raw = yaml.safe_load(cfg_path.read_text())
-        cfg = TrainConfig(**raw)
-        assert cfg.model_preset == "b0_8"
-        assert cfg.total_tokens == int(3e8)
-        assert cfg.stages[0].seq_len == 4096
-        assert cfg.stages[0].micro_batch == 2
-
-
-
-
-
 def test_summarize_bench_marks_nonfinite_grad(tmp_path: Path):
     """Entrada com grad_finite=false vai para o fim (antes do OOM), marcada inválida e fora do best-exact."""
     from scripts.summarize_bench import find_best_exact

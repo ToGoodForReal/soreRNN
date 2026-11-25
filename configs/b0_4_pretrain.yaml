@@ -1,0 +1,27 @@
+# Pré-treino do preset b0_4 (~0,41B) na RTX 3050 8GB (desktop Linux): 10B tokens, contexto 2K até 7B
+# e 4K depois. Operação em docs/RUNBOOK.md.
+model_preset: b0_4
+# BF16 com checkpoint full: na 3050 de 8GB os pesos, os gradientes e os estados dos otimizadores em fp32
+# já somam ~5,3 GB. Confirme o pico com o portão de memória do runbook (§2) antes de lançar.
+model_overrides: {grad_checkpoint: true, checkpoint_policy: full, checkpoint_frac: 1.0}
+# Shards uint32 de scripts/make_pretrain_data.py, gerados com o tokenizer podado de data/tokenizer.
+data_paths: ["data/pretrain/*/*.bin"]
+# <|endoftext|> no tokenizer podado: confira com o eos_id de data/tokenizer/meta.json (o
+# scripts/launch_pretrain.sh recusa começar se o eos_id e o vocab do manifest dos dados não baterem).
+eos_id: 98278
+
+# 2048 x 2 x 64 = 4096 x 1 x 64 = 262.144 tokens por passo -> 38.146 passos
+grad_accum: 64
+stages:
+  - {until_tokens: 7e9, seq_len: 2048, micro_batch: 2}
+  - {until_tokens: 10e9, seq_len: 4096, micro_batch: 1}
+total_tokens: 10e9
+
+warmup_steps: 1000
+# last.pt (~3,7 GB) a cada ~38 passos (~1,5-2 h a 1,5-2K tok/s); snapshot numerado a cada 1e9 tokens
+# (~6-8 dias), guardando os 4 mais novos (~15 GB).
+ckpt_every_tokens: 1e7
+snapshot_every_tokens: 1e9
+keep_snapshots: 4
+compile: true
+out_dir: runs/b0_4_pretrain

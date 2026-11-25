@@ -108,6 +108,13 @@ def _setup_root(tmp_path: Path) -> Path:
     return root
 
 
+def test_setup_only_warns_without_the_pt_sample(tmp_path):
+    # numa máquina nova a amostra PT só pode ser gerada depois do `uv sync` que este script faz
+    root = _mini_repo(tmp_path)
+    res = _run(root, "setup_worker.sh", _env(tmp_path, FAKE_PYCHECK="ok"), "--check")
+    assert res.returncode == 0 and "sample_000.bin ausente" in res.stderr
+
+
 def test_setup_fails_when_torch_has_no_cuda(tmp_path):
     root = _setup_root(tmp_path)
     res = _run(root, "setup_worker.sh", _env(tmp_path, FAKE_PYCHECK="nocuda"), "--check")

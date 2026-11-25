@@ -3,7 +3,8 @@
 Formato em disco: inteiros little-endian crus, `uint32` (`<u4`) ou `uint16` (`<u2`), mais um sidecar
 JSON `{"n_tokens": int, "dtype": "uint32" | "uint16"}` ao lado (`path.with_suffix(".json")`). O
 `uint16` serve para vocabulários de até 65.536 ids (a amostra PT, o s150m) e ocupa metade do disco
-(o b0_8, com 98.304 ids, precisa de `uint32`: 50B tokens = 200 GB). O stream lê os dois formatos e os mistura sem diferença nos batches.
+(o b0_4, com 98.304 ids, precisa de `uint32`: 10B tokens = 40 GB). O stream lê os dois formatos e os
+mistura sem diferença nos batches.
 
 O stream sorteia unidades fixas de `unit_len` tokens por uma permutação determinística de
 `(seed, epoch, unit_len)`, corta cada unidade em janelas consecutivas de `seq_len + 1` tokens
@@ -12,7 +13,6 @@ O stream sorteia unidades fixas de `unit_len` tokens por uma permutação determ
 """
 from __future__ import annotations
 
-import glob
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,91 +233,3 @@ class PackedTokenStream:
         self.position = d["position"]
         self.tokens_consumed = d["tokens_consumed"]
         self._perm = self._permutation()
-
-
-class StreamDataset:
-    """Interface streaming de alto nível para carregar shards contíguos de tokens uint32.
-
-    Compatível com shards produzidos por `BinarySharder` (`sore.data.sharder`),
-    permitindo iteração sequencial e consumo por janelas (`next_window`).
-
-    Parâmetros:
-        paths: Lista de caminhos ou caminho individual dos arquivos binários de shard.
-        seq_len: Comprimento da janela de tokens retornada (padrão: 4096).
-        unit_len: Tamanho da unidade de empacotamento nos shards (padrão: 8192).
-        seed: Semente determinística para o cursor do stream (padrão: 42).
-        eos_id: ID do token de fim de documento; se None, deduz do sidecar JSON do shard (padrão: None).
-        micro_batch: Quantidade de janelas por lote interno (padrão: 1).
-    """
-
-    def __init__(
-        self,
-        paths: list[str | Path] | str | Path,
-        seq_len: int = 4096,
-        unit_len: int = 8192,
-        seed: int = 42,
-        eos_id: int | None = None,
-        micro_batch: int = 1,
-    ) -> None:
-        if isinstance(paths, (str, Path)):
-            paths = [paths]
-        resolved_paths: list[Path] = []
-        for p in paths:
-            p_str = str(p)
-            if "*" in p_str or "?" in p_str:
-                matches = sorted(glob.glob(p_str))
-                resolved_paths.extend(Path(m) for m in matches)
-            else:
-                resolved_paths.append(Path(p))
-        self.paths = resolved_paths
-        if not self.paths:
-            raise ValueError("é preciso ao menos um shard")
-
-        if eos_id is None:
-            sidecar = self.paths[0].with_suffix(".json")
-            if sidecar.exists():
-                try:
-                    meta = json.loads(sidecar.read_text(encoding="utf-8"))
-                    eos_id = meta.get("eos_id", 0)
-                except Exception:
-                    eos_id = 0
-            else:
-                eos_id = 0
-
-        self.eos_id = int(eos_id)
-        self.seq_len = int(seq_len)
-        self.unit_len = int(unit_len)
-        self.micro_batch = int(micro_batch)
-        self.seed = int(seed)
-
-        self._stream = PackedTokenStream(
-            paths=self.paths,
-            seq_len=self.seq_len,
-            micro_batch=self.micro_batch,
-            eos_id=self.eos_id,
-            seed=self.seed,
-            unit_len=self.unit_len,
-        )
-
-    @property
-    def n_tokens(self) -> int:
-        """Quantidade total de tokens agregada em todos os shards carregados."""
-        return self._stream._n_tokens
-
-    def next_window(self) -> torch.Tensor:
-        """Avança o stream e retorna a próxima janela de `seq_len` tokens como tensor 1D."""
-        batch = next(self._stream)
-        return batch.input_ids[0]
-
-    def __iter__(self) -> StreamDataset:
-        return self
-
-    def __next__(self) -> Batch:
-        return next(self._stream)
-
-    def state_dict(self) -> dict:
-        return self._stream.state_dict()
-
-    def load_state_dict(self, state: dict) -> None:
-        self._stream.load_state_dict(state)
-

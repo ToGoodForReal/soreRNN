@@ -643,7 +643,7 @@ def test_load_train_config_coerces_scientific_notation(tmp_path):
         3e-3, 500, 0.2, 0.1, 1.0
     )
     assert TrainConfig.lr_muon == TrainConfig.lr_adamw
-    assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 165.0)
+    assert (cfg.compile, cfg.log_every, cfg.seed, cfg.device, cfg.peak_tflops) == (False, 10, 0, "auto", 18.2)
     assert (cfg.snapshot_every_tokens, cfg.keep_snapshots) == (0, 3)  # snapshots desligados por padrão
     assert (cfg.mtp_weight_start, cfg.mtp_weight_end, cfg.spike_threshold) == (None, 0.1, 0.3)
 
@@ -696,9 +696,10 @@ def test_load_train_config_rejects_invalid(tmp_path, stages, total, extra, match
     "name, preset, tokens_per_step, n_stages",
     [
         ("tiny_local.yaml", "tiny", 512, 2),
-        ("s150m_ablation.yaml", "s150m", 131_072, 2),
+        ("s150m_ablation.yaml", "s150m", 262_144, 1),
         ("s150m_quality.yaml", "s150m", 65_536, 1),
-        ("b0_8_pretrain.yaml", "b0_8", 524_288, 2),
+        ("b0_4_pretrain.yaml", "b0_4", 262_144, 2),
+        ("b0_4_validate.yaml", "b0_4", 262_144, 2),
     ],
 )
 def test_shipped_configs_load(name, preset, tokens_per_step, n_stages):
@@ -709,16 +710,17 @@ def test_shipped_configs_load(name, preset, tokens_per_step, n_stages):
     get_preset(cfg.model_preset, **cfg.model_overrides)  # overrides são campos válidos
 
 
-def test_b0_8_config_values():
-    cfg = load_train_config(REPO / "configs" / "b0_8_pretrain.yaml")
-    assert cfg.stages == [Stage(35_000_000_000, 4096, 2), Stage(50_000_000_000, 8192, 1)]
-    assert (cfg.total_tokens, cfg.grad_accum, cfg.compile) == (50_000_000_000, 64, True)
-    # BF16 com checkpoint full em todos os blocos: ~15,9 GB, deixando ~8 GB para outro treino na GPU
-    assert cfg.fp8 == "off"
+def test_b0_4_config_values():
+    cfg = load_train_config(REPO / "configs" / "b0_4_pretrain.yaml")
+    assert cfg.stages == [Stage(7_000_000_000, 2048, 2), Stage(10_000_000_000, 4096, 1)]
+    assert (cfg.total_tokens, cfg.grad_accum, cfg.compile, cfg.total_steps) == (10_000_000_000, 64, True, 38_146)
+    # BF16 com checkpoint full em todos os blocos (RTX 3050 8GB)
+    assert cfg.fp8 == "off" and cfg.max_vram_gb is None
     assert cfg.model_overrides == {"grad_checkpoint": True, "checkpoint_policy": "full", "checkpoint_frac": 1.0}
-    assert cfg.max_vram_gb == 16.5  # GPU dividida: ~8 GB livres para outro treino
-    # só o last.pt, sobrescrito a cada 5e7 tokens (~95 passos); snapshots numerados desligados
-    assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens) == (50_000_000, 0)
+    # eos do tokenizer podado; o vocab do tokenizer cabe no do modelo
+    assert cfg.eos_id == 98278 < get_preset(cfg.model_preset, **cfg.model_overrides).vocab_size
+    # last.pt a cada 1e7 tokens (~38 passos) e 4 snapshots numerados, um a cada 1e9
+    assert (cfg.ckpt_every_tokens, cfg.snapshot_every_tokens, cfg.keep_snapshots) == (10_000_000, 1_000_000_000, 4)
 
 
 def test_resolve_data_paths(tmp_path):

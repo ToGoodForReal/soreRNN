@@ -151,7 +151,7 @@ def train_step(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--preset", required=True, help="preset do modelo (tiny, s150m, b0_8)")
+    parser.add_argument("--preset", required=True, help="preset do modelo (tiny, s150m, b0_4, b0_8)")
     parser.add_argument("--seq-len", type=int, required=True)
     parser.add_argument("--micro-batch", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True, help="passos totais, incluindo o warmup")
@@ -164,7 +164,9 @@ def main() -> None:
     parser.add_argument("--fp8", choices=["off", "tensorwise", "rowwise"], default="off", help="FP8 via torchao (off, tensorwise, rowwise)")
     parser.add_argument("--fp8-emulate", action="store_true", help="emula FP8 para teste em GPU < sm89")
     parser.add_argument("--grad-checkpoint", action="store_true", help="activation checkpointing por bloco")
-    parser.add_argument("--peak-tflops", type=float, default=165.0, help="pico BF16 denso da GPU (4090: 165)")
+    parser.add_argument(
+        "--peak-tflops", type=float, default=18.2, help="pico BF16 denso da GPU (RTX 3050 8GB: 18,2; RTX 4090: 165)"
+    )
     parser.add_argument("--json", action="store_true", help="imprime também o resultado em JSON")
     parser.add_argument(
         "--override", action="append", default=[], metavar="KEY=VALUE",

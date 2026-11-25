@@ -115,7 +115,8 @@ class TrainConfig:
     out_dir: str
     seed: int = 0
     device: str = "auto"  # "auto" -> "cuda" se disponível, senão "cpu"
-    peak_tflops: float = 165.0  # pico BF16 denso da GPU (4090) para o MFU do metrics.jsonl
+    # pico BF16 denso (acumulação fp32) da GPU para o MFU do metrics.jsonl: RTX 3050 8GB = 18,2; RTX 4090 = 165
+    peak_tflops: float = 18.2
     # Teto de VRAM do alocador do PyTorch (GB, sem o contexto CUDA de ~0,5 GB); None = sem teto. Com a
     # GPU dividida com outro treino, passar do teto dá OOM aqui em vez de tomar a memória do outro.
     max_vram_gb: float | None = None

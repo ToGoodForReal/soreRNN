@@ -1,16 +1,18 @@
 """Poda o tokenizer Qwen3.5 para `--vocab-size` ids por frequência numa amostra da mistura (spec §4).
 
-Amostra: ~`--sample-tokens` tokens repartidos entre as fontes pelos pesos de `MIXTURE`, lidos de
+Amostra: ~`--sample-tokens` tokens repartidos entre as fontes pelos pesos de `calibration_mixture(--code-frac)`
+(a `MIXTURE` do treino com o código levado a `--code-frac`, padrão 25%, para a poda guardar mais tokens de
+código), lidos de
 até `--files-per-source` arquivos espaçados de cada fonte (para não ficar num só dump/arquivo).
 Avaliação (fora da amostra): fertilidade (tokens por palavra) do vocabulário completo e do podado
 em PT (C4-pt local de `data/raw`, outra fonte que não a da amostra), EN e código (último arquivo
-de cada fonte), e o round-trip `decode(encode(x)) == NFC(x)`. Critério da spec: PT no máximo 3%
-pior que o vocabulário completo.
+de cada fonte), e o round-trip `decode(encode(x)) == NFC(x)`. Critérios: PT no máximo 3% pior que o
+vocabulário completo (spec) e código no máximo `--max-code-fertility-loss` (padrão 3%) pior.
 
 Saída em `--out`: `tokenizer.json` (podado, com os tokens adicionados), `old_to_new.npy`,
 `counts.npy` (contagens da amostra no vocabulário completo) e `meta.json`.
 
-Uso: uv run python scripts/prune_tokenizer.py --out data/tokenizer [--vocab-size 98304] [--sample-tokens 2e8]
+Uso: uv run python scripts/prune_tokenizer.py --out data/tokenizer [--vocab-size 98304] [--sample-tokens 2e8] [--code-frac 0.25]
 """
 from __future__ import annotations
 
@@ -25,17 +27,21 @@ import numpy as np
 from huggingface_hub import HfApi
 from tokenizers import Tokenizer
 
-from sore.train.sources import MIXTURE, SOURCES, hub_path, iter_documents, list_files
+from sore.train.sources import SOURCES, calibration_mixture, hub_path, iter_documents, list_files
 from sore.train.text_sample import download, iter_jsonl_gz_texts, resolve_revision
 from sore.train.tokenizer_prune import build_pruned, select_vocab, to_json_str, without_added_tokens
 
 EVAL_DOCS = 2000
 
 
-def sample_counts(tokenizer, n_ids: int, sample_tokens: int, files_per_source: int, revisions: dict) -> tuple:
+def sample_counts(
+    tokenizer, n_ids: int, sample_tokens: int, files_per_source: int, revisions: dict, mixture: dict[str, float]
+) -> tuple:
     counts = np.zeros(n_ids, dtype=np.int64)
     used: dict[str, dict] = {}
-    for name, weight in MIXTURE.items():
+    for name, weight in mixture.items():
+        if weight <= 0:
+            continue
         src = SOURCES[name]
         files = list_files(src, revisions[name])
         step = max(1, len(files) // files_per_source)
@@ -88,7 +94,16 @@ def main() -> None:
     parser.add_argument("--revision", default="main")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
     parser.add_argument("--max-pt-fertility-loss", type=float, default=0.03)
+    parser.add_argument("--code-frac", type=float, default=0.25, help="fração de código na amostra de calibração")
+    parser.add_argument("--max-code-fertility-loss", type=float, default=0.03)
     args = parser.parse_args()
+    mixture = calibration_mixture(args.code_frac)
+    # o portão de PT é o critério da spec: sem o C4-pt local ele passaria sem medir nada
+    if not sorted(args.raw_dir.glob("c4-pt.tfrecord-*.json.gz")):
+        parser.error(
+            f"nenhum c4-pt.tfrecord-*.json.gz em {args.raw_dir} (texto PT fora da amostra para o portão de "
+            "fertilidade); gere com scripts/make_text_sample.py, que baixa esses arquivos em data/raw"
+        )
 
     revision = resolve_revision(args.tokenizer, args.revision)
     tok_path = download(
@@ -101,8 +116,8 @@ def main() -> None:
     budget = args.vocab_size - len(tok_json["added_tokens"])
 
     api = HfApi()
-    revisions = {name: api.dataset_info(SOURCES[name].repo).sha for name in MIXTURE}
-    counts, used = sample_counts(full, n_ids, int(args.sample_tokens), args.files_per_source, revisions)
+    revisions = {name: api.dataset_info(SOURCES[name].repo).sha for name in SOURCES}
+    counts, used = sample_counts(full, n_ids, int(args.sample_tokens), args.files_per_source, revisions, mixture)
     keep = select_vocab(tok_json, counts, budget)
     pruned_json, old_to_new = build_pruned(tok_json, keep)
     pruned = Tokenizer.from_str(to_json_str(without_added_tokens(pruned_json)))
@@ -131,15 +146,23 @@ def main() -> None:
         "bpe_tokens": len(keep),
         "merges": len(pruned_json["model"]["merges"]),
         "eos_id": eos["id"],
-        "sample": {"tokens": int(counts.sum()), "sources": used, "dataset_revisions": revisions},
+        "sample": {
+            "tokens": int(counts.sum()), "code_frac": args.code_frac, "mixture": mixture,
+            "sources": used, "dataset_revisions": revisions,
+        },
         "fertility": fert,
         "roundtrip_failures": len(bad),
     }
     (args.out / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     print(f"{args.out}: vocab {meta['vocab_size']} (eos_id {meta['eos_id']}), {meta['merges']} merges", flush=True)
-    pt_loss = fert.get("pt", {}).get("loss", 0.0)
-    if bad or pt_loss > args.max_pt_fertility_loss:
-        raise SystemExit(f"REPROVADO: round-trip {len(bad)} falha(s), fertilidade PT {pt_loss:+.2%}")
+    pt_loss = fert["pt"]["loss"]
+    code_loss = fert.get("code", {}).get("loss", 0.0)
+    if bad or pt_loss > args.max_pt_fertility_loss or code_loss > args.max_code_fertility_loss:
+        raise SystemExit(
+            f"REPROVADO: round-trip {len(bad)} falha(s), fertilidade PT {pt_loss:+.2%} (máx. "
+            f"{args.max_pt_fertility_loss:+.0%}), código {code_loss:+.2%} (máx. {args.max_code_fertility_loss:+.0%}). "
+            "PT acima: baixe --code-frac ou suba --vocab-size; código acima: suba --code-frac ou --vocab-size"
+        )
     print("APROVADO", flush=True)
 
 

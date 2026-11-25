@@ -273,7 +273,7 @@ def test_train_fp8_resume_cross_toggle(tmp_path: Path, device: str):
 
 @pytest.mark.fp8
 def test_fp8_real_smoke():
-    """Smoke test real na 4090: s150m com seq 2048, 3 passos com fp8='rowwise'."""
+    """Smoke test real em GPU sm89+ (ex.: 4090; pulado na 3050): s150m com seq 2048, 3 passos com fp8='rowwise'."""
     device = torch.device("cuda")
     cfg = get_preset("s150m")
     model = SoreLM(cfg).to(device)

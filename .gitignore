@@ -16,7 +16,7 @@ CMakeFiles/
 .DS_Store
 Thumbs.db
 
-# Generated artifacts (produced by scripts/prepare_data.py and train_sequential)
+# Generated artifacts (legacy C++ engine)
 checkpoints/
 data/*.bin
 
